@@ -23,7 +23,7 @@ from typing import Any
 
 # Configure logging
 logging.basicConfig(
-    filename='app.log',
+    filename='tnpy.log',
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
@@ -90,7 +90,8 @@ def handle_fail(
     else:
         return
 
-    status = tla_serial = log_msg = message
+    status = log_msg = message
+    tla_serial = "N/A"
     log_and_print('error', log_msg)
 
     while not lhconv_pass or not rhconv_pass:

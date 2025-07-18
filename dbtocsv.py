@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 db_path = "/home/gap900/tndb900.db"
 # CSV export directory
 csv_dir = "/home/gap900/csv_exports"
-usb_csv_dir = "/media/usb/csv_exports"
+usb_csv_dir = "/media/usbdrive/csv_exports"
 
 # Configure logging
 logging.basicConfig(

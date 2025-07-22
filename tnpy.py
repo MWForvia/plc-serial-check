@@ -244,7 +244,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
 
 def main() -> None:
     """
-    Parse command-line arguments and start the monitoring loop.
+    Parse command-line arguments, sync DB at startup, and start the monitoring loop.
     """
     parser = argparse.ArgumentParser(
         description="TN barcode converter serial checker"
@@ -254,13 +254,18 @@ def main() -> None:
         help="IP address of the Allen-Bradley PLC"
     )
     parser.add_argument(
-        "--db", default="~/tndb900.db",
+        "--db", default=default_local_db,
         help="Path to the SQLite database file"
     )
     args = parser.parse_args()
 
     db_file = os.path.expanduser(args.db)
     log_and_print('info', f"Starting tnpy: PLC={args.plc}, DB={db_file}")
+
+    # initial sync at startup
+    sync_db_from_backup(db_file)
+
+    # begin PLC monitoring with dynamic sync on USB presence
     monitor_and_update(args.plc, db_file)
 
 if __name__ == "__main__":

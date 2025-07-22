@@ -8,15 +8,6 @@ both locally and to a USB-mounted directory. If anything goes wrong
 waits, retries until it succeeds, and then backs up the DB file.
 
 Daily logs are kept in ~/dbtocsv_logs/ with date suffix; active log lives at ~/dbtocsv.log.
-Saved files-
-    CSV Exports (File name has yesterday's date appended)
-        /home/gap900/csv_exports/YYYY-MM-DD.csv
-        /media/usbdrive/csv_exports/YYYY-MM-DD.csv
-    DB Backups (Current and dated)
-        /home/gap900/db_backup/tndb900.db
-        /media/usbdrive/db_backup/tndb900.db
-        /home/gap900/db_backup/tndb900_YYYY-MM-DD.db
-        /media/usbdrive/db_backup/tndb900_YYYY-MM-DD.db
 """
 
 import sqlite3
@@ -48,7 +39,6 @@ handler = TimedRotatingFileHandler(
     backupCount=0    # keep all logs indefinitely
 )
 handler.suffix = "%Y-%m-%d"
-# move rotated files into the backup_dir
 handler.namer = lambda name: str(backup_dir / Path(name).name)
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 handler.setFormatter(formatter)
@@ -61,7 +51,9 @@ def log_and_print(level: str, message: str) -> None:
     """
     Log at the given level and also print to stdout.
     """
-    logging.log(getattr(logging, level)(0), message)
+    # Use numeric level lookup and log via logging.log()
+    level_num = getattr(logging, level.upper(), logging.INFO)
+    logging.log(level_num, message)
     print(message)
 
 

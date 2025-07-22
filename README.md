@@ -33,4 +33,14 @@ PLC_TAGS (tnpy.py) =
     'TN_CHECK_FAIL': 'TN_Check_Fail',
     'TN_DB_ERROR': 'TN_DB_Error'
 
+Saved files (dbtocsv.py - runs daily at 3am)
+    CSV Exports (File name has yesterday's date appended)
+        /home/gap900/csv_exports/YYYY-MM-DD.csv
+        /media/usbdrive/csv_exports/YYYY-MM-DD.csv
+    DB Backups (Current and dated)
+        /home/gap900/db_backup/tndb900.db
+        /media/usbdrive/db_backup/tndb900.db
+        /home/gap900/db_backup/tndb900_YYYY-MM-DD.db
+        /media/usbdrive/db_backup/tndb900_YYYY-MM-DD.db
+
 

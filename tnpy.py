@@ -83,7 +83,7 @@ SQL_STATEMENTS = {
 
 # Timing configuration
 POLL_INTERVAL = 0.5   # seconds while online (inside connection)
-RETRY_DELAY   = 5     # seconds between reconnect attempts when offline
+RETRY_DELAY   = 10     # seconds between reconnect attempts when offline
 
 
 def log_and_print(level: str, message: str) -> None:

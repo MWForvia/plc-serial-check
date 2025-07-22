@@ -8,6 +8,16 @@ both locally and to a USB-mounted directory. If anything goes wrong
 waits, retries until it succeeds, and then backs up the DB file.
 
 Daily logs are kept in ~/dbtocsv_logs/ with date suffix; active log lives at ~/dbtocsv.log.
+
+Saved files-
+    CSV Exports (File name has yesterday's date appended)
+        /home/gap900/csv_exports/YYYY-MM-DD.csv
+        /media/usbdrive/csv_exports/YYYY-MM-DD.csv
+    DB Backups (Current and dated)
+        /home/gap900/db_backup/tndb900.db
+        /media/usbdrive/db_backup/tndb900.db
+        /home/gap900/db_backup/tndb900_YYYY-MM-DD.db
+        /media/usbdrive/db_backup/tndb900_YYYY-MM-DD.db
 """
 
 import sqlite3

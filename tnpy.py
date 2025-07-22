@@ -19,26 +19,39 @@ Schema:
 import argparse
 import logging
 import sys
+from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
 import sqlite3
 import time
 import os
 import shutil
 from typing import Any
 
-# Configure logging as early as possible
-logging.basicConfig(
-    filename='tnpy.log',
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+# Configure active log in home + daily rotated backups in ~/tnpy_logs
+active_log = Path.home() / "tnpy.log"
+backup_dir = Path.home() / "tnpy_logs"
+backup_dir.mkdir(parents=True, exist_ok=True)
+handler = TimedRotatingFileHandler(
+    filename=str(active_log),
+    when="midnight",
+    interval=1,
+    backupCount=0  # keep all rotated logs indefinitely
 )
+handler.suffix = "%Y-%m-%d"
+# Place rotated files into backup_dir
+handler.namer = lambda name: str(backup_dir / Path(name).name)
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+handler.setFormatter(formatter)
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
+logger.addHandler(handler)
 
 # Attempt to import PLC driver and error type
 try:
     from pycomm3 import LogixDriver, CommError
 except ImportError as e:
-    error_msg = f"Required module pycomm3 not found: {e}"
-    logging.error(error_msg)
-    print(error_msg, file=sys.stderr)
+    logging.error(f"Required module pycomm3 not found: {e}")
+    print(f"Required module pycomm3 not found: {e}", file=sys.stderr)
     sys.exit(1)
 
 # Local and USB backup database paths
@@ -79,9 +92,6 @@ def log_and_print(level: str, message: str) -> None:
 
 
 def sync_db_from_backup(local_db: str) -> None:
-    """
-    If the USB backup DB has more rows than the local DB, overwrite the local copy.
-    """
     if not os.path.exists(USB_DB_BACKUP):
         return
     try:
@@ -106,13 +116,11 @@ def sync_db_from_backup(local_db: str) -> None:
 
 def wait_for_tag(plc: LogixDriver, tag_key: str) -> None:
     tag_name = PLC_TAGS[tag_key]
-    # wait for low
     while True:
         r = plc.read(tag_name)
         if r and not r.value:
             break
         time.sleep(POLL_INTERVAL)
-    # wait for high
     while True:
         r = plc.read(tag_name)
         if r and r.value:
@@ -168,14 +176,8 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
 
 
 def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
-    """
-    Main loop: keep trying to connect to the PLC forever.
-    Once connected, process scans continuously.
-    """
     while True:
-        # dynamic sync when USB media is plugged in
         sync_db_from_backup(db_file)
-
         try:
             log_and_print('info', f"Attempting connection to PLC at {plc_ip_address}")
             with LogixDriver(plc_ip_address) as plc:
@@ -212,60 +214,32 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                 plc.write((PLC_TAGS['TN_CHECK_PASS'], False))
                                 plc.write((PLC_TAGS['TN_CHECK_FAIL'], True))
                                 handle_fail(lh_pass, rh_pass, plc, cursor, lhconv, rhconv)
-
                         except CommError as e_comm_inner:
                             log_and_print('error', f"Lost PLC connection during processing: {e_comm_inner}")
                             break
                         except Exception as e_inner:
                             import traceback
-                            log_and_print(
-                                'error',
-                                f"Error during PLC processing: {e_inner}\n{traceback.format_exc()}"
-                            )
+                            log_and_print('error', f"Error during PLC processing: {e_inner}\n{traceback.format_exc()}")
                             plc.write((PLC_TAGS['TN_DB_ERROR'], True))
-
         except KeyboardInterrupt:
             log_and_print('info', "Interrupted by user, exiting.")
             sys.exit(0)
         except CommError as e_comm:
-            log_and_print(
-                'error',
-                f"CommError connecting to PLC ({plc_ip_address}): {e_comm}. Retrying in {RETRY_DELAY}s."
-            )
+            log_and_print('error', f"CommError connecting to PLC ({plc_ip_address}): {e_comm}. Retrying in {RETRY_DELAY}s.")
         except Exception as e:
             import traceback
-            log_and_print(
-                'error',
-                f"Unexpected error in monitor_and_update: {e}\n{traceback.format_exc()}\nRetrying in {RETRY_DELAY}s."
-            )
-
+            log_and_print('error', f"Unexpected error in monitor_and_update: {e}\n{traceback.format_exc()}\nRetrying in {RETRY_DELAY}s.")
         time.sleep(RETRY_DELAY)
 
 
 def main() -> None:
-    """
-    Parse command-line arguments, sync DB at startup, and start the monitoring loop.
-    """
-    parser = argparse.ArgumentParser(
-        description="TN barcode converter serial checker"
-    )
-    parser.add_argument(
-        "--plc", default="10.131.201.60",
-        help="IP address of the Allen-Bradley PLC"
-    )
-    parser.add_argument(
-        "--db", default=default_local_db,
-        help="Path to the SQLite database file"
-    )
+    parser = argparse.ArgumentParser(description="TN barcode converter serial checker")
+    parser.add_argument("--plc", default="10.131.201.60", help="IP address of the Allen-Bradley PLC")
+    parser.add_argument("--db", default=default_local_db, help="Path to the SQLite database file")
     args = parser.parse_args()
-
     db_file = os.path.expanduser(args.db)
     log_and_print('info', f"Starting tnpy: PLC={args.plc}, DB={db_file}")
-
-    # initial sync at startup
     sync_db_from_backup(db_file)
-
-    # begin PLC monitoring with dynamic sync on USB presence
     monitor_and_update(args.plc, db_file)
 
 if __name__ == "__main__":

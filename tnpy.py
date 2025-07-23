@@ -19,46 +19,72 @@ Schema:
 import argparse
 import logging
 import sys
-from logging.handlers import TimedRotatingFileHandler
-from pathlib import Path
 import sqlite3
 import time
 import os
 import shutil
+from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
 from typing import Any
 
-# Configure active log in home + daily rotated backups in ~/tnpy_logs
-active_log = Path.home() / "tnpy.log"
-backup_dir = Path.home() / "tnpy_logs"
-backup_dir.mkdir(parents=True, exist_ok=True)
-handler = TimedRotatingFileHandler(
-    filename=str(active_log),
+# Setup log directories and handlers
+log_dir = Path.home() / "tnpy_logs"
+log_dir.mkdir(parents=True, exist_ok=True)
+
+# INFO handler: logs INFO and above to ~/tnpy.log
+info_log = Path.home() / "tnpy.log"
+info_handler = TimedRotatingFileHandler(
+    filename=str(info_log),
     when="midnight",
     interval=1,
-    backupCount=0  # keep all rotated logs indefinitely
+    backupCount=0
 )
-handler.suffix = "%Y-%m-%d"
-# Place rotated files into backup_dir
-handler.namer = lambda name: str(backup_dir / Path(name).name)
-formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-handler.setFormatter(formatter)
-logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
-logger.addHandler(handler)
+info_handler.suffix = "%Y-%m-%d"
+info_handler.namer = lambda name: str(log_dir / Path(name).name)
+info_handler.setLevel(logging.INFO)
+info_handler.setFormatter(
+    logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+)
+
+# DEBUG handler: logs DEBUG and above to ~/tnpy_debug.log
+debug_log = Path.home() / "tnpy_debug.log"
+debug_handler = TimedRotatingFileHandler(
+    filename=str(debug_log),
+    when="midnight",
+    interval=1,
+    backupCount=0
+)
+debug_handler.suffix = "%Y-%m-%d"
+debug_handler.namer = lambda name: str(log_dir / Path(name).name)
+debug_handler.setLevel(logging.DEBUG)
+debug_handler.setFormatter(
+    logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+)
+
+# Configure root logger
+tool_logger = logging.getLogger()
+tool_logger.setLevel(logging.DEBUG)
+tool_logger.addHandler(info_handler)
+tool_logger.addHandler(debug_handler)
+
+# Convenience wrapper
+def log_and_print(level: str, message: str) -> None:
+    lvl = getattr(logging, level.upper(), logging.INFO)
+    logging.log(lvl, message)
+    print(message)
 
 # Attempt to import PLC driver and error type
 try:
     from pycomm3 import LogixDriver, CommError
 except ImportError as e:
-    logging.error(f"Required module pycomm3 not found: {e}")
-    print(f"Required module pycomm3 not found: {e}", file=sys.stderr)
+    log_and_print('error', f"Required module pycomm3 not found: {e}")
     sys.exit(1)
 
-# Local and USB backup database paths
+# Paths for local and USB backup DBs
 default_local_db = "/home/gap900/tndb900.db"
-USB_DB_BACKUP  = "/media/usbdrive/db_backup/tndb900.db"
+USB_DB_BACKUP = "/media/usbdrive/db_backup/tndb900.db"
 
-# PLC tags grouped for easy lookup
+# PLC tags
 PLC_TAGS = {
     'LH_CONV': 'FIX_513D.Conv_Barcode.EXTRACT[2]',
     'RH_CONV': 'FIX_513D.Conv_Barcode_R.EXTRACT[2]',
@@ -75,20 +101,14 @@ PLC_TAGS = {
 # SQL statements
 SQL_STATEMENTS = {
     'insert_tn': (
-        "INSERT INTO tn "
-        "(date, finished_serial, component_serial1, component_serial2, status) "
+        "INSERT INTO tn (date, finished_serial, component_serial1, component_serial2, status) "
         "VALUES (?, ?, ?, ?, ?)"
     )
 }
 
-# Timing configuration
-POLL_INTERVAL = 0.5   # seconds while online (inside connection)
-RETRY_DELAY   = 10     # seconds between reconnect attempts when offline
-
-
-def log_and_print(level: str, message: str) -> None:
-    logging.log(getattr(logging, level.upper()), message)
-    print(message)
+# Timing
+POLL_INTERVAL = 0.5  # seconds
+RETRY_DELAY = 10     # seconds
 
 
 def sync_db_from_backup(local_db: str) -> None:
@@ -115,15 +135,15 @@ def sync_db_from_backup(local_db: str) -> None:
 
 
 def wait_for_tag(plc: LogixDriver, tag_key: str) -> None:
-    tag_name = PLC_TAGS[tag_key]
+    name = PLC_TAGS[tag_key]
     while True:
-        r = plc.read(tag_name)
-        if r and not r.value:
+        val = plc.read(name)
+        if val and not val.value:
             break
         time.sleep(POLL_INTERVAL)
     while True:
-        r = plc.read(tag_name)
-        if r and r.value:
+        val = plc.read(name)
+        if val and val.value:
             return
         time.sleep(POLL_INTERVAL)
 
@@ -179,7 +199,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
     while True:
         sync_db_from_backup(db_file)
         try:
-            log_and_print('info', f"Attempting connection to PLC at {plc_ip_address}")
+            log_and_print('debug', f"Attempting connection to PLC at {plc_ip_address}")
             with LogixDriver(plc_ip_address) as plc:
                 log_and_print('info', "PLC connection established.")
                 while True:

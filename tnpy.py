@@ -84,6 +84,14 @@ PLC_TAGS = {
     'FIRST_PIECE_CHECK':'FIRST_PIECE_CHECK'
 }
 
+PLC_TAGS.update({
+    'REWORK_MODE':            'REWORK_MODE',
+    'REWORK_LABEL_DATE':      'REWORK_LABEL_DATE',
+    'REWORK_LABEL_FINISHED':  'REWORK_LABEL_FINISHED',
+    'REWORK_LABEL_LH':        'REWORK_LABEL_LH',
+    'REWORK_LABEL_RH':        'REWORK_LABEL_RH',
+})
+
 SQL_STATEMENTS = {
     'insert_tn': (
         "INSERT INTO tn (date, finished_serial, component_serial1, component_serial2, status) "
@@ -328,7 +336,90 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                                  'Passed - Previously failed leak test.')
                             continue
 
-                        # 2) Normal pass / fail
+                        # 2) Rework Mode
+                        rework = plc.read(PLC_TAGS['REWORK_MODE'])
+                        if rework and rework.value:
+                            # helper: poll a PLC tag until it returns a non-empty string
+                            def wait_for_label(tag_key: str) -> str:
+                                tag = PLC_TAGS[tag_key]
+                                while True:
+                                    r = plc.read(tag)
+                                    val = r.value if r else None
+                                    if isinstance(val, str) and val.strip():
+                                        return val
+                                    time.sleep(POLL_INTERVAL)
+
+                            # poll each label field until data is present
+                            label_date = wait_for_label('REWORK_LABEL_DATE')
+                            label_fs   = wait_for_label('REWORK_LABEL_FINISHED')
+                            label_lh   = wait_for_label('REWORK_LABEL_LH')
+                            label_rh   = wait_for_label('REWORK_LABEL_RH')
+
+                             # look for an exact match in the DB
+                            cursor.execute(
+                                 "SELECT id FROM tn "
+                                 "WHERE date = ? AND finished_serial = ? "
+                                 "  AND component_serial1 = ? AND component_serial2 = ?",
+                                 (label_date, label_fs, label_lh, label_rh)
+                             )
+                            row = cursor.fetchone()
+
+                            valid = False
+                            if row:
+                                 row_id = row[0]
+                                 # ensure none of those SNs appear in any other row
+                                 cursor.execute(
+                                     "SELECT COUNT(*) FROM tn WHERE finished_serial = ? AND id != ?",
+                                     (label_fs, row_id)
+                                 )
+                                 fs_dup = cursor.fetchone()[0]
+                                 cursor.execute(
+                                     "SELECT COUNT(*) FROM tn WHERE component_serial1 = ? AND id != ?",
+                                     (label_lh, row_id)
+                                 )
+                                 lh_dup = cursor.fetchone()[0]
+                                 cursor.execute(
+                                     "SELECT COUNT(*) FROM tn WHERE component_serial2 = ? AND id != ?",
+                                     (label_rh, row_id)
+                                 )
+                                 rh_dup = cursor.fetchone()[0]
+                                 if fs_dup == 0 and lh_dup == 0 and rh_dup == 0:
+                                     valid = True
+
+                            if valid:
+                                 logger.info("Rework Pass: matched row %s", row_id)
+                                 set_pass(plc, True)
+                                 if wait_for_datastore_or_reset(plc):
+                                     ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                                     cursor.execute(
+                                         SQL_STATEMENTS['insert_tn'],
+                                         (ts, label_fs, label_lh, label_rh, 'Rework Pass')
+                                     )
+                                     conn.commit()
+                                     logger.info("Data stored in local DB (Rework Pass)")
+                                     insert_tn_record(
+                                         USB_DB_BACKUP, ts, label_fs, label_lh, label_rh, 'Rework Pass'
+                                     )
+                            else:
+                                 logger.error(
+                                     "Rework Fail: label data date=%s, fs=%s, lh=%s, rh=%s",
+                                     label_date, label_fs, label_lh, label_rh
+                                 )
+                                 set_pass(plc, False)
+                                 if wait_for_fail_or_reset(plc):
+                                     ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                                     cursor.execute(
+                                         SQL_STATEMENTS['insert_tn'],
+                                         (ts, 'N/A', label_lh, label_rh, 'Rework Fail')
+                                     )
+                                     conn.commit()
+                                     logger.error("Data stored in local DB (Rework Fail)")
+                                     insert_tn_record(
+                                         USB_DB_BACKUP, ts, 'N/A', label_lh, label_rh, 'Rework Fail'
+                                     )
+                            continue
+
+                        # 3) Normal pass / fail
                         lh_pass = check_converter_sn(cursor, 'component_serial1', lhconv, 'LH')
                         rh_pass = check_converter_sn(cursor, 'component_serial2', rhconv, 'RH')
 

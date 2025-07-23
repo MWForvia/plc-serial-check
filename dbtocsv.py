@@ -25,11 +25,11 @@ import csv
 import time
 import os
 import shutil
-import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 import logging
 from logging.handlers import TimedRotatingFileHandler
+import traceback  # keep for exception logging
 
 # Configuration
 DB_PATH        = "/home/gap900/tndb900.db"
@@ -38,111 +38,153 @@ USB_CSV_DIR    = "/media/usbdrive/csv_exports"
 DB_BACKUP_DIRS = ["/media/usbdrive/db_backup", "/home/gap900/db_backup"]
 RETRY_DELAY    = 60   # seconds between retry attempts
 
+# directory where rotated logs live
+LOG_BACKUP_DIR = Path.home() / "dbtocsv_logs"
+LOG_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
 # Setup logging: active log at ~/dbtocsv.log, rotated daily into ~/dbtocsv_logs
-active_log = Path.home() / "dbtocsv.log"
-backup_dir = Path.home() / "dbtocsv_logs"
-backup_dir.mkdir(parents=True, exist_ok=True)
-handler = TimedRotatingFileHandler(
-    filename=str(active_log),
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+# INFO handler: only file‐save successes
+info_log     = Path.home() / "dbtocsv.log"
+info_handler = TimedRotatingFileHandler(
+    filename=str(info_log),
     when="midnight",
     interval=1,
-    backupCount=0    # keep all logs indefinitely
+    backupCount=0
 )
-handler.suffix = "%Y-%m-%d"
-handler.namer = lambda name: str(backup_dir / Path(name).name)
-formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-handler.setFormatter(formatter)
+info_handler.suffix    = "%Y-%m-%d"
+info_handler.namer     = lambda name: str(LOG_BACKUP_DIR / Path(name).name)
+info_handler.setLevel  (logging.INFO)
+info_handler.setFormatter(formatter)
+
+# DEBUG handler: all other statuses, retries, errors
+debug_log     = Path.home() / "dbtocsv_debug.log"
+debug_handler = TimedRotatingFileHandler(
+    filename=str(debug_log),
+    when="midnight",
+    interval=1,
+    backupCount=0
+)
+debug_handler.suffix    = "%Y-%m-%d"
+debug_handler.namer     = lambda name: str(LOG_BACKUP_DIR / Path(name).name)
+debug_handler.setLevel  (logging.DEBUG)
+debug_handler.setFormatter(formatter)
+
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
-logger.addHandler(handler)
-
-
-def log_and_print(level: str, message: str) -> None:
-    """
-    Log at the given level and also print to stdout.
-    """
-    # Use numeric level lookup and log via logging.log()
-    level_num = getattr(logging, level.upper(), logging.INFO)
-    logging.log(level_num, message)
-    print(message)
-
-
-def write_csv(path: str, rows: list[tuple]) -> None:
-    """
-    Write the given rows to a CSV file at `path`,
-    creating parent directories if needed.
-    """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, mode="w", newline="") as f:
-        writer = csv.writer(f, delimiter="\t")
-        writer.writerow(["id", "date", "finished_serial", "component_serial1", "component_serial2", "status"])
-        writer.writerows(rows)
-    log_and_print("info", f"CSV file written to {path}")
+logger.addHandler(info_handler)
+logger.addHandler(debug_handler)
 
 
 def export_csv() -> None:
-    conn = sqlite3.connect(DB_PATH)
+    """
+    Export all rows from 'tn' table to daily CSV files in local and USB directories.
+    """
+    yesterday = datetime.now() - timedelta(days=1)
+    filename = yesterday.strftime("%Y-%m-%d") + ".csv"
+
     try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id, date, finished_serial, component_serial1, component_serial2, status "
-            "FROM tn"
-        )
-        rows = cursor.fetchall()
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            # export the entire table each day
+            cursor.execute(
+                "SELECT id, date, finished_serial, component_serial1, component_serial2, status "
+                "FROM tn"
+            )
+
+            rows = cursor.fetchall()
         if not rows:
-            log_and_print("info", "No entries to export.")
+            logger.debug("No entries to export.")
             return
-        yesterday = datetime.now() - timedelta(days=1)
-        filename = yesterday.strftime("%Y-%m-%d") + ".csv"
-        local_path = os.path.join(CSV_DIR, filename)
-        write_csv(local_path, rows)
-        usb_path = os.path.join(USB_CSV_DIR, filename)
-        write_csv(usb_path, rows)
-        log_and_print("info", f"Exported {len(rows)} entries to {local_path} and {usb_path}")
-    finally:
-        conn.close()
+
+        for target_dir in (CSV_DIR, USB_CSV_DIR):
+            path = Path(target_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, mode="w", newline="") as f:
+                writer = csv.writer(f, delimiter="\t")
+                writer.writerow([
+                    "id", "date", "finished_serial",
+                    "component_serial1", "component_serial2", "status"
+                ])
+                writer.writerows(rows)
+            logger.info(f"CSV file written to {path}")
+
+        logger.info(f"Exported {len(rows)} entries to both CSV locations")
+    except Exception:
+        logger.exception("export_csv failed")
 
 
 def backup_db() -> None:
+    """
+    Incrementally append new rows from the live DB to each backup DB
+    instead of copying the entire file each time.
+    """
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cur_rows = conn.execute("SELECT COUNT(*) FROM tn").fetchone()[0]
-    except Exception as e:
-        log_and_print("error", f"Failed to count rows in live DB: {e}")
+        with sqlite3.connect(DB_PATH) as conn_live:
+            total_rows = conn_live.execute("SELECT COUNT(*) FROM tn").fetchone()[0]
+    except Exception:
+        logger.exception("Failed to count rows in live DB")
         return
-    date_str = datetime.now().strftime("%Y-%m-%d")
+
     base = os.path.basename(DB_PATH)
-    dated = base.replace(".db", f"_{date_str}.db")
     for d in DB_BACKUP_DIRS:
         try:
             os.makedirs(d, exist_ok=True)
-            dst_cur = os.path.join(d, base)
-            dst_dat = os.path.join(d, dated)
-            if os.path.exists(dst_cur):
-                with sqlite3.connect(dst_cur) as bconn:
-                    prev_rows = bconn.execute("SELECT COUNT(*) FROM tn").fetchone()[0]
-            else:
-                prev_rows = -1
-            if cur_rows >= prev_rows:
-                shutil.copy2(DB_PATH, dst_cur)
-                log_and_print("info", f"DB current backup succeeded: {dst_cur}")
-                shutil.copy2(DB_PATH, dst_dat)
-                log_and_print("info", f"DB dated backup succeeded: {dst_dat}")
-            else:
-                log_and_print("warning", f"Live DB ({cur_rows}) < backup ({prev_rows}); skipped {dst_cur}")
-        except Exception as e:
-            log_and_print("error", f"DB backup to {d} failed: {e}")
+            backup_path = Path(d) / base
+
+            # If no backup exists, copy entire DB
+            if not backup_path.exists():
+                shutil.copy2(DB_PATH, str(backup_path))
+                logger.info(f"Initial DB backup created: {backup_path}")
+                continue
+
+            # Open backup DB and append only new entries
+            with sqlite3.connect(str(backup_path)) as bconn:
+                bcursor = bconn.cursor()
+                # Ensure table exists
+                bcursor.execute(
+                    "CREATE TABLE IF NOT EXISTS tn ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "date TEXT, finished_serial TEXT, "
+                    "component_serial1 TEXT, component_serial2 TEXT, "
+                    "status TEXT)"
+                )
+                # Find max ID in backup
+                bcursor.execute("SELECT MAX(id) FROM tn")
+                max_id = bcursor.fetchone()[0] or 0
+
+                # Attach live DB and count new rows
+                bconn.execute("ATTACH DATABASE ? AS src", (DB_PATH,))
+                cur = bconn.execute(
+                    "SELECT COUNT(*) FROM src.tn WHERE id > ?", (max_id,)
+                )
+                new_count = cur.fetchone()[0]
+                if new_count > 0:
+                    bconn.execute(
+                        "INSERT INTO tn(date, finished_serial, component_serial1, component_serial2, status) "
+                        "SELECT date, finished_serial, component_serial1, component_serial2, status "
+                        "FROM src.tn WHERE id > ?", (max_id,)
+                    )
+                bconn.execute("DETACH DATABASE src")
+                bconn.commit()
+                logger.info(f"Appended {new_count} new rows to backup DB: {backup_path}")
+
+        except Exception:
+            logger.exception(f"Incremental DB backup to {d} failed")
 
 
 def main() -> None:
     while True:
         try:
             export_csv()
-            log_and_print("info", "Export completed successfully.")
+            # individual file‐save messages are logged in write_csv/export_csv
             backup_db()
+            # final success message
+            logger.info("Export completed successfully.")
             break
         except Exception:
-            logging.exception("Export failed, will retry")
+            logger.info(f"Export failed, will retry: {traceback.format_exc()}")
             time.sleep(RETRY_DELAY)
 
 if __name__ == "__main__":

@@ -19,11 +19,11 @@ Schema:
 import argparse
 import logging
 import sys
+from logging.handlers import TimedRotatingFileHandler
 import sqlite3
 import time
 import os
 import shutil
-from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -62,22 +62,16 @@ debug_handler.setFormatter(
 )
 
 # Configure root logger
-tool_logger = logging.getLogger()
-tool_logger.setLevel(logging.DEBUG)
-tool_logger.addHandler(info_handler)
-tool_logger.addHandler(debug_handler)
-
-# Convenience wrapper
-def log_and_print(level: str, message: str) -> None:
-    lvl = getattr(logging, level.upper(), logging.INFO)
-    logging.log(lvl, message)
-    print(message)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+logger.addHandler(info_handler)
+logger.addHandler(debug_handler)
 
 # Attempt to import PLC driver and error type
 try:
     from pycomm3 import LogixDriver, CommError
 except ImportError as e:
-    log_and_print('error', f"Required module pycomm3 not found: {e}")
+    logger.error("Required module pycomm3 not found: %s", e)
     sys.exit(1)
 
 # Paths for local and USB backup DBs
@@ -117,26 +111,46 @@ RETRY_DELAY = 10     # seconds
 
 
 def sync_db_from_backup(local_db: str) -> None:
+    """
+    If there's a USB‐backed up DB, restore it to local_db when:
+      1) local_db doesn't exist, or
+      2) USB copy has more rows (i.e. it's more up‐to‐date).
+    """
     if not os.path.exists(USB_DB_BACKUP):
+        logger.debug("No USB DB backup present at %s", USB_DB_BACKUP)
         return
+
     try:
         with sqlite3.connect(USB_DB_BACKUP) as usb_conn:
             usb_rows = usb_conn.execute("SELECT COUNT(*) FROM tn").fetchone()[0]
     except Exception:
+        logger.exception("Unable to read USB backup DB at %s", USB_DB_BACKUP)
         return
+
     local_rows = 0
     if os.path.exists(local_db):
         try:
             with sqlite3.connect(local_db) as loc_conn:
                 local_rows = loc_conn.execute("SELECT COUNT(*) FROM tn").fetchone()[0]
         except Exception:
-            return
-    if usb_rows > local_rows:
+            logger.exception("Unable to read local DB at %s", local_db)
+            # If we can't read it, overwrite it with USB backup
+            local_rows = -1
+
+    # Only restore when local is missing or behind USB
+    if not os.path.exists(local_db) or usb_rows > local_rows:
         try:
+            os.makedirs(os.path.dirname(local_db) or ".", exist_ok=True)
             shutil.copy2(USB_DB_BACKUP, local_db)
-            log_and_print('info', f"Synced local DB ({local_rows} rows) from USB ({usb_rows} rows)")
-        except Exception as e:
-            log_and_print('error', f"DB sync failed: {e}")
+            logger.info(
+                "Restored local DB from USB backup: %s (local rows=%d, usb rows=%d)",
+                local_db, local_rows, usb_rows
+            )
+        except Exception:
+            logger.exception(
+                "Failed to copy USB DB %s to local %s",
+                USB_DB_BACKUP, local_db
+            )
 
 
 def wait_for_tag(plc: LogixDriver, tag_key: str) -> None:
@@ -175,9 +189,9 @@ def wait_for_fail_or_reset(plc: LogixDriver) -> bool:
 def check_converter_sn(cursor: sqlite3.Cursor, column: str, sn: Any, label: str) -> bool:
     cursor.execute(f"SELECT 1 FROM tn WHERE {column} = ?", (sn,))
     if cursor.fetchone():
-        log_and_print('warning', f"{label} Converter SN Failed: {sn}")
+        logger.warning("%s Converter SN Failed: %s", label, sn)
         return False
-    log_and_print('info', f"{label} Converter SN Passed: {sn}")
+    logger.info("%s Converter SN Passed: %s", label, sn)
     return True
 
 
@@ -198,32 +212,56 @@ def is_leaktest_rerun_allowed(cursor: sqlite3.Cursor, lhconv: Any, rhconv: Any) 
     return cursor.fetchone()[0] == 0
 
 
+# Helper to set pass/fail bits on PLC
+def set_pass(plc: LogixDriver, passed: bool) -> None:
+    plc.write((PLC_TAGS['TN_CHECK_PASS'], passed))
+    plc.write((PLC_TAGS['TN_CHECK_FAIL'], not passed))
+
+
+# Helper to write a TN record into any SQLite DB (local or USB)
+def insert_tn_record(db_path: str, timestamp: str, finished_serial: Any,
+                     lhconv: Any, rhconv: Any, status: str) -> None:
+    try:
+        with sqlite3.connect(db_path) as conn2:
+            cur2 = conn2.cursor()
+            cur2.execute(
+                SQL_STATEMENTS['insert_tn'],
+                (timestamp, finished_serial, lhconv, rhconv, status)
+            )
+            conn2.commit()
+            logger.info("Data stored in USB backup database: %s", db_path)
+    except Exception as e:
+        logger.error("Failed to write TN record to USB backup DB %s: %s", db_path, e)
+
+
 def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
-                cursor: sqlite3.Cursor, lhconv: Any, rhconv: Any) -> None:
-    """
-    Handle the fail case for LH/RH converter serial number duplication or leak test failure.
-    """
+                 cursor: sqlite3.Cursor, lhconv: Any, rhconv: Any) -> None:
+     """
+     Handle the fail case for LH/RH converter serial number duplication or leak test failure.
+     """
 
     # 1) Leak-test failure branch
     leak = plc.read(PLC_TAGS['LEAK_TEST_FAIL'])
     if leak and leak.value:
         status = "Part Failed Leaktest"
-        log_and_print('error', status)
+        logger.error(status)
         if wait_for_fail_or_reset(plc):
             ts = time.strftime('%Y-%m-%d %H:%M:%S')
+            # insert local
             cursor.execute(SQL_STATEMENTS['insert_tn'],
                            (ts, 'N/A', lhconv, rhconv, status))
             cursor.connection.commit()
-            log_and_print('error', "Leak Test Failed - Data stored in database")
+            logger.error("Leak Test Failed - Data stored in database")
+            # replicate to USB
+            insert_tn_record(USB_DB_BACKUP, ts, 'N/A', lhconv, rhconv, status)
         return
 
-    # 2) Duplicate-SN logic with first-instance TLA lookup
+    # 2) Duplicate-SN logic with first-instance lookup
     # Determine base status message
     if not lh_pass and not rh_pass:
         base_status = "LH & RH SN Dupe - Failed"
-        # Find first TLA for either converter
         cursor.execute(
-            "SELECT tla_serial FROM tn "
+            "SELECT finished_serial FROM tn "
             "WHERE component_serial1=? OR component_serial2=? "
             "ORDER BY id ASC LIMIT 1",
             (lhconv, rhconv)
@@ -231,7 +269,7 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
     elif not lh_pass:
         base_status = "LH SN Dupe - Failed"
         cursor.execute(
-            "SELECT tla_serial FROM tn "
+            "SELECT finished_serial FROM tn "
             "WHERE component_serial1=? "
             "ORDER BY id ASC LIMIT 1",
             (lhconv,)
@@ -239,7 +277,7 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
     else:
         base_status = "RH SN Dupe - Failed"
         cursor.execute(
-            "SELECT tla_serial FROM tn "
+            "SELECT finished_serial FROM tn "
             "WHERE component_serial2=? "
             "ORDER BY id ASC LIMIT 1",
             (rhconv,)
@@ -250,13 +288,16 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
     status = f"{base_status} (first TLA: {first_tla})"
 
     # Log and wait for part-fail/reset
-    log_and_print('error', status)
+    logger.error(status)
     if wait_for_fail_or_reset(plc):
         ts = time.strftime('%Y-%m-%d %H:%M:%S')
+        # insert local
         cursor.execute(SQL_STATEMENTS['insert_tn'],
                        (ts, 'N/A', lhconv, rhconv, status))
         cursor.connection.commit()
-        log_and_print('error', "Failed TN Check - Data stored in database")
+        logger.error("Failed TN Check - Data stored in database")
+        # replicate to USB
+        insert_tn_record(USB_DB_BACKUP, ts, 'N/A', lhconv, rhconv, status)
 
 
 def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
@@ -267,9 +308,9 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
         while True:
             try:
                 plc.write((PLC_TAGS['PI_HEARTBEAT'], state))
-                logging.debug(f"Heartbeat sent: {state}")
+                logger.debug("Heartbeat sent: %s", state)
             except Exception as e:
-                logging.debug(f"Heartbeat error: {e}")
+                logger.debug("Heartbeat error: %s", e)
                 break
             state = not state
             time.sleep(1)
@@ -277,11 +318,11 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
     while True:
         sync_db_from_backup(db_file)
         try:
-            log_and_print('debug', f"Attempting connection to PLC at {plc_ip_address}")
+            logger.debug("Attempting connection to PLC at %s", plc_ip_address)
             with LogixDriver(plc_ip_address) as plc:
                 # start heartbeat thread
                 threading.Thread(target=heartbeat_loop, args=(plc,), daemon=True).start()
-                log_and_print('info', "PLC connection established.")
+                logger.info("PLC connection established.")
                 while True:
                     wait_for_tag(plc, 'SCAN_COMPLETE')
                     with sqlite3.connect(db_file) as conn:
@@ -293,86 +334,94 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             # 0) First‐piece (test part) check
                             fpc = plc.read(PLC_TAGS['FIRST_PIECE_CHECK'])
                             if fpc and fpc.value:
-                                log_and_print('info', "First Piece Check - test part detected")
-                                plc.write((PLC_TAGS['TN_CHECK_PASS'], True))
-                                plc.write((PLC_TAGS['TN_CHECK_FAIL'], False))
+                                logger.info("First Piece Check - test part detected")
+                                set_pass(plc, True)
                                 if wait_for_datastore_or_reset(plc):
                                     finished_serial = plc.read(PLC_TAGS['FINISHED_SERIAL']).value
                                     ts = time.strftime('%Y-%m-%d %H:%M:%S')
+                                    # insert local
                                     cursor.execute(
                                         SQL_STATEMENTS['insert_tn'],
                                         (ts, finished_serial, lhconv, rhconv, 'First Piece Check')
                                     )
                                     conn.commit()
-                                    log_and_print('info', "Data stored in database (First Piece Check)")
+                                    logger.info("Data stored in local database (First Piece Check)")
+                                    # replicate to USB
+                                    insert_tn_record(
+                                        USB_DB_BACKUP, ts, finished_serial, lhconv, rhconv, 'First Piece Check'
+                                    )
                                 continue  # skip normal pass/fail logic
 
                             # 1) Leak-test rerun logic
                             if is_leaktest_rerun_allowed(cursor, lhconv, rhconv):
-                                log_and_print(
-                                    'info',
-                                    f"Rerun allowed for LH={lhconv}, RH={rhconv} due to previous leak test failure."
+                                logger.info(
+                                    "Rerun allowed for LH=%s, RH=%s due to previous leak test failure.",
+                                    lhconv, rhconv
                                 )
-                                plc.write((PLC_TAGS['TN_CHECK_PASS'], True))
-                                plc.write((PLC_TAGS['TN_CHECK_FAIL'], False))
+                                set_pass(plc, True)
                                 # wait for datastore or reset, then insert rerun entry
                                 if wait_for_datastore_or_reset(plc):
                                     finished_serial = plc.read(PLC_TAGS['FINISHED_SERIAL']).value
                                     ts = time.strftime('%Y-%m-%d %H:%M:%S')
+                                    # insert local
                                     cursor.execute(
                                         SQL_STATEMENTS['insert_tn'],
                                         (ts, finished_serial, lhconv, rhconv,
                                          'Passed - Previously failed leak test.')
                                     )
                                     conn.commit()
-                                    log_and_print('info', "Data stored in database (Leak Test Rerun)")
+                                    logger.info("Data stored in local database (Leak Test Rerun)")
+                                    # replicate to USB
+                                    insert_tn_record(
+                                        USB_DB_BACKUP, ts, finished_serial, lhconv, rhconv,
+                                        'Passed - Previously failed leak test.'
+                                    )
                                 continue  # skip normal pass/fail
 
-                            # 1) Normal duplicate-SN check
-                            lh_pass = check_converter_sn(
-                                cursor, 'component_serial1', lhconv, 'LH'
-                            )
-                            rh_pass = check_converter_sn(
-                                cursor, 'component_serial2', rhconv, 'RH'
-                            )
+                            # 2) Normal pass / fail
+                            lh_pass = check_converter_sn(cursor, 'component_serial1', lhconv, 'LH')
+                            rh_pass = check_converter_sn(cursor, 'component_serial2', rhconv, 'RH')
 
                             if lh_pass and rh_pass:
-                                res = plc.write((PLC_TAGS['TN_CHECK_PASS'], True))
-                                if not res or getattr(res, 'error', False):
-                                    log_and_print('error', f"Write TN_CHECK_PASS failed: {res}")
-                                res = plc.write((PLC_TAGS['TN_CHECK_FAIL'], False))
-                                if not res or getattr(res, 'error', False):
-                                    log_and_print('error', f"Write TN_CHECK_FAIL failed: {res}")
-                                log_and_print('info', "TN Check Passed")
-
+                                set_pass(plc, True)
                                 if wait_for_datastore_or_reset(plc):
                                     finished_serial = plc.read(PLC_TAGS['FINISHED_SERIAL']).value
-                                    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+                                    ts = time.strftime('%Y-%m-%d %H:%M:%S')
                                     cursor.execute(
                                         SQL_STATEMENTS['insert_tn'],
-                                        (timestamp, finished_serial, lhconv, rhconv, 'Passed')
+                                        (ts, finished_serial, lhconv, rhconv, 'Passed')
                                     )
                                     conn.commit()
-                                    log_and_print('info', "Data stored in database")
+                                    logger.info("Data stored in local database")
+                                    insert_tn_record(
+                                        USB_DB_BACKUP, ts, finished_serial, lhconv, rhconv, 'Passed'
+                                    )
                             else:
-                                plc.write((PLC_TAGS['TN_CHECK_PASS'], False))
-                                plc.write((PLC_TAGS['TN_CHECK_FAIL'], True))
+                                set_pass(plc, False)
                                 handle_fail(lh_pass, rh_pass, plc, cursor, lhconv, rhconv)
+
                         except CommError as e_comm_inner:
-                            log_and_print('error', f"Lost PLC connection during processing: {e_comm_inner}")
+                            logger.error("Lost PLC connection during processing: %s", e_comm_inner)
                             break
-                        except Exception as e_inner:
-                            import traceback
-                            log_and_print('error', f"Error during PLC processing: {e_inner}\n{traceback.format_exc()}")
+
+                        except sqlite3.Error as db_err:
+                            logger.error("SQLite error during processing: %s", db_err)
                             plc.write((PLC_TAGS['TN_DB_ERROR'], True))
+                        except Exception as e_inner:
+                            logger.exception("Unexpected error during PLC processing")
+                            plc.write((PLC_TAGS['TN_DB_ERROR'], True))
+
         except KeyboardInterrupt:
-            log_and_print('info', "Interrupted by user, exiting.")
+            logger.info("Interrupted by user, exiting.")
             sys.exit(0)
+
         except CommError as e_comm:
-            log_and_print('error', f"CommError connecting to PLC ({plc_ip_address}): {e_comm}. Retrying in {RETRY_DELAY}s.")
+            logger.error("CommError connecting to PLC %s: %s – retrying in %ds",
+                         plc_ip_address, e_comm, RETRY_DELAY)
+
         except Exception as e:
-            import traceback
-            log_and_print('error', f"Unexpected error in monitor_and_update: {e}\n{traceback.format_exc()}\nRetrying in {RETRY_DELAY}s.")
+            logger.exception("Unexpected error in monitor_and_update – retrying in %ds", RETRY_DELAY)
+
         time.sleep(RETRY_DELAY)
 
 
@@ -382,7 +431,7 @@ def main() -> None:
     parser.add_argument("--db", default=default_local_db, help="Path to the SQLite database file")
     args = parser.parse_args()
     db_file = os.path.expanduser(args.db)
-    log_and_print('info', f"Starting tnpy: PLC={args.plc}, DB={db_file}")
+    logger.info("Starting tnpy: PLC=%s, DB=%s", args.plc, db_file)
     sync_db_from_backup(db_file)
     monitor_and_update(args.plc, db_file)
 

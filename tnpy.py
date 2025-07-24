@@ -25,8 +25,10 @@ import sqlite3
 import time
 import os
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
+from datetime import datetime, timedelta
 
 # --- Logging setup ---
 log_dir = Path.home() / "tnpy_logs"
@@ -108,6 +110,47 @@ POLL_INTERVAL      = 0.5   # general polling interval
 FAST_POLL_INTERVAL = 0.1   # fast polling for fail/datastore
 RETRY_DELAY        = 10    # seconds between retries
 
+# --- USB health & formatting helpers ---
+def get_device_for_mount(mount_point: str) -> str:
+    """
+    Return the block device (e.g. /dev/sda1) backing this mount point.
+    """
+    try:
+        out = subprocess.check_output(
+            ["findmnt", "-n", "-o", "SOURCE", mount_point],
+            text=True
+        ).strip()
+        return out
+    except Exception:
+        logger.exception("Cannot determine device for mount %s", mount_point)
+        raise
+
+def reformat_usb(mount_point: str) -> None:
+    """
+    Unmount, format as FAT32, and remount the USB at mount_point.
+    """
+    dev = get_device_for_mount(mount_point)
+    subprocess.run(["umount", mount_point], check=True)
+    subprocess.run(["mkfs.vfat", "-F", "32", dev], check=True)
+    subprocess.run(["mount", dev, mount_point], check=True)
+    logger.info("Reformatted and remounted %s (%s)", mount_point, dev)
+
+def check_db_integrity(db_path: str) -> bool:
+    """
+    Run PRAGMA integrity_check on the given SQLite DB.
+    Returns True if OK, False on any error or corruption.
+    """
+    try:
+        with sqlite3.connect(db_path) as conn:
+            result = conn.execute("PRAGMA integrity_check;").fetchone()[0]
+        if result != "ok":
+            logger.error("Integrity check failed for %s: %s", db_path, result)
+            return False
+    except Exception as e:
+        logger.error("Error checking integrity of %s: %s", db_path, e)
+        return False
+    return True
+
 # --- Helper functions ---
 
 def sync_db_from_backup(local_db: str) -> None:
@@ -115,14 +158,35 @@ def sync_db_from_backup(local_db: str) -> None:
     Tri‐directional sync: pick the DB (local, USB1 or USB2) with the most rows
     and copy it over the other two, so the richest DB is the source‐of‐truth.
     """
+    # --- Health check USB2 only; if corrupted, reformat & clone from local or USB1 ---
+    usb2 = USB_DB_BACKUP2
+    if os.path.exists(usb2) and not check_db_integrity(usb2):
+        # choose a healthy source: prefer local, else USB1
+        healthy = None
+        if os.path.exists(local_db) and check_db_integrity(local_db):
+            healthy = local_db
+        elif os.path.exists(USB_DB_BACKUP) and check_db_integrity(USB_DB_BACKUP):
+            healthy = USB_DB_BACKUP
+
+        if healthy:
+            logger.warning("Repairing corrupted USB2 DB at %s from %s", usb2, healthy)
+            mount_pt = os.path.dirname(usb2)
+            reformat_usb(mount_pt)
+            os.makedirs(mount_pt, exist_ok=True)
+            shutil.copy2(healthy, usb2)
+            logger.info("Cloned %s → %s", healthy, usb2)
+        else:
+            logger.critical(
+                "No healthy source to repair corrupted USB2 DB at %s", usb2
+            )
+
+    # --- count rows in local, USB1, USB2 and sync richest → others ---
     paths = {
         'local': local_db,
         'usb1':  USB_DB_BACKUP,
         'usb2':  USB_DB_BACKUP2,
     }
-    # check existence
     exists = {name: os.path.exists(p) for name, p in paths.items()}
-    # count rows
     rows = {}
     for name, p in paths.items():
         if exists[name]:
@@ -377,74 +441,94 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                         return val
                                     time.sleep(POLL_INTERVAL)
 
-                            # poll each label field until data is present
-                            label_date = wait_for_label('REWORK_LABEL_DATE')
+                            # poll the raw Julian date and convert to ISO YYYY-MM-DD
+                            raw_julian = wait_for_label('REWORK_LABEL_DATE')
+                            # PLC gives YYDDD (e.g. "25157" → year 2025, day 157)
+                            yy = int(raw_julian[:2])
+                            doy = int(raw_julian[2:])
+                            label_date = (
+                                datetime(2000 + yy, 1, 1)
+                                + timedelta(days=doy - 1)
+                            ).strftime('%Y-%m-%d')
+
+                            # now poll the rest of the label fields
                             label_fs   = wait_for_label('REWORK_LABEL_FINISHED')
                             label_lh   = wait_for_label('REWORK_LABEL_LH')
                             label_rh   = wait_for_label('REWORK_LABEL_RH')
 
-                             # look for an exact match in the DB
+                            # look for an exact match on the date portion of our timestamp
                             cursor.execute(
-                                 "SELECT id FROM tn "
-                                 "WHERE date = ? AND finished_serial = ? "
-                                 "  AND component_serial1 = ? AND component_serial2 = ?",
-                                 (label_date, label_fs, label_lh, label_rh)
-                             )
+                                "SELECT id FROM tn "
+                                "WHERE substr(date,1,10) = ? "
+                                "  AND finished_serial = ? "
+                                "  AND component_serial1 = ? "
+                                "  AND component_serial2 = ?",
+                                (label_date, label_fs, label_lh, label_rh)
+                            )
                             row = cursor.fetchone()
 
                             valid = False
                             if row:
-                                 row_id = row[0]
-                                 # ensure none of those SNs appear in any other row
-                                 cursor.execute(
-                                     "SELECT COUNT(*) FROM tn WHERE finished_serial = ? AND id != ?",
-                                     (label_fs, row_id)
-                                 )
-                                 fs_dup = cursor.fetchone()[0]
-                                 cursor.execute(
-                                     "SELECT COUNT(*) FROM tn WHERE component_serial1 = ? AND id != ?",
-                                     (label_lh, row_id)
-                                 )
-                                 lh_dup = cursor.fetchone()[0]
-                                 cursor.execute(
-                                     "SELECT COUNT(*) FROM tn WHERE component_serial2 = ? AND id != ?",
-                                     (label_rh, row_id)
-                                 )
-                                 rh_dup = cursor.fetchone()[0]
-                                 if fs_dup == 0 and lh_dup == 0 and rh_dup == 0:
-                                     valid = True
+                                row_id = row[0]
+                                # ensure none of those SNs appear in any other row
+                                cursor.execute(
+                                    "SELECT COUNT(*) FROM tn WHERE finished_serial = ? AND id != ?",
+                                    (label_fs, row_id)
+                                )
+                                fs_dup = cursor.fetchone()[0]
+                                cursor.execute(
+                                    "SELECT COUNT(*) FROM tn WHERE component_serial1 = ? AND id != ?",
+                                    (label_lh, row_id)
+                                )
+                                lh_dup = cursor.fetchone()[0]
+                                cursor.execute(
+                                    "SELECT COUNT(*) FROM tn WHERE component_serial2 = ? AND id != ?",
+                                    (label_rh, row_id)
+                                )
+                                rh_dup = cursor.fetchone()[0]
+
+                                if fs_dup == 0 and lh_dup == 0 and rh_dup == 0:
+                                    # new: also verify the scanned LH_CONV/RH_CONV match the label & DB
+                                    if lhconv == label_lh and rhconv == label_rh:
+                                        valid = True
+                                    else:
+                                        logger.error(
+                                            "Rework Fail: scanned converter SNs do not match label data "
+                                            "(scanned LH=%s vs label %s, scanned RH=%s vs label %s)",
+                                            lhconv, label_lh, rhconv, label_rh
+                                        )
 
                             if valid:
-                                 logger.info("Rework Pass: matched row %s", row_id)
-                                 set_pass(plc, True)
-                                 if wait_for_datastore_or_reset(plc):
-                                     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                                     cursor.execute(
-                                         SQL_STATEMENTS['insert_tn'],
-                                         (ts, label_fs, label_lh, label_rh, 'Rework Pass')
-                                     )
-                                     conn.commit()
-                                     logger.info("Data stored in local DB (Rework Pass)")
-                                     insert_tn_record(
-                                         USB_DB_BACKUP, ts, label_fs, label_lh, label_rh, 'Rework Pass'
-                                     )
+                                logger.info("Rework Pass: matched row %s", row_id)
+                                set_pass(plc, True)
+                                if wait_for_datastore_or_reset(plc):
+                                    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                                    cursor.execute(
+                                        SQL_STATEMENTS['insert_tn'],
+                                        (ts, label_fs, label_lh, label_rh, 'Rework Pass')
+                                    )
+                                    conn.commit()
+                                    logger.info("Data stored in local DB (Rework Pass)")
+                                    insert_tn_record(
+                                        USB_DB_BACKUP, ts, label_fs, label_lh, label_rh, 'Rework Pass'
+                                    )
                             else:
-                                 logger.error(
-                                     "Rework Fail: label data date=%s, fs=%s, lh=%s, rh=%s",
-                                     label_date, label_fs, label_lh, label_rh
-                                 )
-                                 set_pass(plc, False)
-                                 if wait_for_fail_or_reset(plc):
-                                     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                                     cursor.execute(
-                                         SQL_STATEMENTS['insert_tn'],
-                                         (ts, 'N/A', label_lh, label_rh, 'Rework Fail')
-                                     )
-                                     conn.commit()
-                                     logger.error("Data stored in local DB (Rework Fail)")
-                                     insert_tn_record(
-                                         USB_DB_BACKUP, ts, 'N/A', label_lh, label_rh, 'Rework Fail'
-                                     )
+                                logger.error(
+                                    "Rework Fail: label data date=%s, fs=%s, lh=%s, rh=%s",
+                                    label_date, label_fs, label_lh, label_rh
+                                )
+                                set_pass(plc, False)
+                                if wait_for_fail_or_reset(plc):
+                                    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                                    cursor.execute(
+                                        SQL_STATEMENTS['insert_tn'],
+                                        (ts, 'N/A', label_lh, label_rh, 'Rework Fail')
+                                    )
+                                    conn.commit()
+                                    logger.error("Data stored in local DB (Rework Fail)")
+                                    insert_tn_record(
+                                        USB_DB_BACKUP, ts, 'N/A', label_lh, label_rh, 'Rework Fail'
+                                    )
                             continue
 
                         # 3) Normal pass / fail

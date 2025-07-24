@@ -90,6 +90,9 @@ PLC_TAGS.update({
     'REWORK_LABEL_FINISHED':  'REWORK_LABEL_FINISHED',
     'REWORK_LABEL_LH':        'REWORK_LABEL_LH',
     'REWORK_LABEL_RH':        'REWORK_LABEL_RH',
+    'TLA_SN_PASS':            'TLA_SN_PASS',
+    'TN_TLA_SN_CHECK_PASS':   'TN_TLA_SN_CHECK_PASS',
+    'SERIAL_HOLDER':          'ZEBRA.Working_String[20]',
 })
 
 SQL_STATEMENTS = {
@@ -107,38 +110,71 @@ RETRY_DELAY        = 10    # seconds between retries
 
 def sync_db_from_backup(local_db: str) -> None:
     """
-    If USB backup exists and is ahead of local_db, overwrite local_db from USB.
+    Bidirectional sync: use the DB with more rows as source-of-truth.
     """
-    if not os.path.exists(USB_DB_BACKUP):
-        logger.debug("No USB DB backup present at %s", USB_DB_BACKUP)
+    usb_exists = os.path.exists(USB_DB_BACKUP)
+    local_exists = os.path.exists(local_db)
+
+    if not usb_exists and not local_exists:
+        logger.warning(
+            "Neither local DB (%s) nor USB backup (%s) exist; nothing to sync",
+            local_db, USB_DB_BACKUP
+        )
         return
 
-    try:
-        with sqlite3.connect(USB_DB_BACKUP) as usb_conn:
-            usb_rows = usb_conn.execute("SELECT COUNT(*) FROM tn").fetchone()[0]
-    except Exception:
-        logger.exception("Unable to read USB backup DB at %s", USB_DB_BACKUP)
-        return
-
-    local_rows = -1
-    if os.path.exists(local_db):
+    # Count rows in USB backup (if present)
+    usb_rows = -1
+    if usb_exists:
         try:
-            with sqlite3.connect(local_db) as loc_conn:
-                local_rows = loc_conn.execute("SELECT COUNT(*) FROM tn").fetchone()[0]
+            with sqlite3.connect(USB_DB_BACKUP) as usb_conn:
+                usb_rows = usb_conn.execute("SELECT COUNT(*) FROM tn").fetchone()[0]
+        except Exception:
+            logger.exception("Unable to read USB backup DB at %s", USB_DB_BACKUP)
+
+    # Count rows in local DB (if present)
+    local_rows = -1
+    if local_exists:
+        try:
+            with sqlite3.connect(local_db) as local_conn:
+                local_rows = local_conn.execute("SELECT COUNT(*) FROM tn").fetchone()[0]
         except Exception:
             logger.exception("Unable to read local DB at %s", local_db)
 
-    if not os.path.exists(local_db) or usb_rows > local_rows:
+    # Sync the richer DB to the poorer one
+    if usb_rows > local_rows:
+        # USB is more up-to-date → copy to local
         try:
             os.makedirs(os.path.dirname(local_db) or ".", exist_ok=True)
             shutil.copy2(USB_DB_BACKUP, local_db)
             logger.info(
-                "Restored local DB from USB backup: %s (local rows=%d, usb rows=%d)",
+                "Synced local DB from USB backup: %s (local rows=%d, usb rows=%d)",
                 local_db, local_rows, usb_rows
             )
         except Exception:
-            logger.exception("Failed to copy USB DB %s to local %s", USB_DB_BACKUP, local_db)
+            logger.exception(
+                "Failed to copy USB DB %s to local %s",
+                USB_DB_BACKUP, local_db
+            )
 
+    elif local_rows > usb_rows:
+        # Local is more up-to-date → copy to USB
+        try:
+            os.makedirs(os.path.dirname(USB_DB_BACKUP) or ".", exist_ok=True)
+            shutil.copy2(local_db, USB_DB_BACKUP)
+            logger.info(
+                "Synced USB backup from local DB: %s (local rows=%d, usb rows=%d)",
+                USB_DB_BACKUP, local_rows, usb_rows
+            )
+        except Exception:
+            logger.exception(
+                "Failed to copy local DB %s to USB %s",
+                local_db, USB_DB_BACKUP
+            )
+
+    else:
+        # Equal row counts → assume already in sync
+        logger.debug("Databases in sync: %d rows each",
+                     local_rows)
 
 def wait_for_tag(plc: LogixDriver, tag_key: str) -> None:
     name = PLC_TAGS[tag_key]
@@ -426,14 +462,61 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         if lh_pass and rh_pass:
                             set_pass(plc, True)
                             if wait_for_datastore_or_reset(plc):
-                                finished_serial = plc.read(PLC_TAGS['FINISHED_SERIAL']).value
+                                # If we're at step 143, enforce unique finished_serial
+                                if plc.read(PLC_TAGS['SEQ_STEP']).value == 143:
+                                    while True:
+                                        raw_fs = plc.read(PLC_TAGS['SERIAL_HOLDER']).value or ""
+                                        tla_sn = raw_fs[1:] if raw_fs.startswith('T') else raw_fs
+
+                                        cursor.execute(
+                                            "SELECT COUNT(*) FROM tn WHERE finished_serial = ?",
+                                            (tla_sn,)
+                                        )
+                                        dup_count = cursor.fetchone()[0]
+                                        if dup_count == 0:
+                                            # unique—pass the TLA_SN check
+                                            plc.write((PLC_TAGS['TN_TLA_SN_CHECK_PASS'], True))
+                                            logger.info(
+                                                "TN_TLA_SN_CHECK_PASS=1 for serial %s", tla_sn
+                                            )
+                                            finished_serial = tla_sn
+                                            break
+
+                                        # duplicate—bump the PLC serial counter
+                                        part_sel = plc.read("FIX_513D.Part_Select").value
+                                        serial_tag = f"FIX_513D.Serial_Number[{part_sel}]"
+                                        curr = plc.read(serial_tag).value or 0
+                                        plc.write((serial_tag, curr + 1))
+                                        logger.info(
+                                            "Incremented %s to %d", serial_tag, curr + 1
+                                        )
+
+                                else:
+                                    # non‐143 steps: just read the finished serial
+                                    finished_serial = plc.read(
+                                        PLC_TAGS['FINISHED_SERIAL']
+                                    ).value
+
                                 ts = time.strftime('%Y-%m-%d %H:%M:%S')
-                                cursor.execute(SQL_STATEMENTS['insert_tn'],
-                                               (ts, finished_serial, lhconv, rhconv, 'Passed'))
+                                # insert into local DB
+                                cursor.execute(
+                                    SQL_STATEMENTS['insert_tn'],
+                                    (ts, finished_serial, lhconv, rhconv, 'Passed')
+                                )
                                 conn.commit()
-                                logger.info("Data stored in local database")
-                                insert_tn_record(USB_DB_BACKUP, ts, finished_serial,
-                                                 lhconv, rhconv, 'Passed')
+                                logger.info("Data stored in local database (Passed)")
+
+                                # replicate to USB
+                                insert_tn_record(
+                                    USB_DB_BACKUP,
+                                    ts, finished_serial, lhconv, rhconv, 'Passed'
+                                )
+
+                                # final PLC pass‐flag for TLA_SN
+                                # (optional: leave TLA_SN_PASS driven by DUP logic above)
+                                plc.write(
+                                    (PLC_TAGS['TLA_SN_PASS'], True)
+                                )
                         else:
                             set_pass(plc, False)
                             handle_fail(lh_pass, rh_pass, plc, cursor, lhconv, rhconv)

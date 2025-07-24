@@ -65,8 +65,10 @@ except ImportError as e:
     sys.exit(1)
 
 # --- Constants ---
-default_local_db = "/home/gap900/tndb900.db"
-USB_DB_BACKUP   = "/media/usbdrive/db_backup/tndb900.db"
+default_local_db   = "/home/gap900/tndb900.db"
+USB_DB_BACKUP      = "/media/usbdrive/db_backup/tndb900.db"
+USB_DB_BACKUP2     = "/media/usbdrive2/db_backup/tndb900.db"
+USB_DB_BACKUPS     = [USB_DB_BACKUP, USB_DB_BACKUP2]
 
 PLC_TAGS = {
     'PI_HEARTBEAT':    'PI_Heartbeat',
@@ -110,71 +112,52 @@ RETRY_DELAY        = 10    # seconds between retries
 
 def sync_db_from_backup(local_db: str) -> None:
     """
-    Bidirectional sync: use the DB with more rows as source-of-truth.
+    Tri‐directional sync: pick the DB (local, USB1 or USB2) with the most rows
+    and copy it over the other two, so the richest DB is the source‐of‐truth.
     """
-    usb_exists = os.path.exists(USB_DB_BACKUP)
-    local_exists = os.path.exists(local_db)
+    paths = {
+        'local': local_db,
+        'usb1':  USB_DB_BACKUP,
+        'usb2':  USB_DB_BACKUP2,
+    }
+    # check existence
+    exists = {name: os.path.exists(p) for name, p in paths.items()}
+    # count rows
+    rows = {}
+    for name, p in paths.items():
+        if exists[name]:
+            try:
+                with sqlite3.connect(p) as conn:
+                    rows[name] = conn.execute("SELECT COUNT(*) FROM tn").fetchone()[0]
+            except Exception:
+                rows[name] = -1
+                logger.exception("Unable to read DB at %s", p)
+        else:
+            rows[name] = -1
 
-    if not usb_exists and not local_exists:
-        logger.warning(
-            "Neither local DB (%s) nor USB backup (%s) exist; nothing to sync",
-            local_db, USB_DB_BACKUP
-        )
+    if all(r < 0 for r in rows.values()):
+        logger.warning("No database files found at any of %s", paths)
         return
 
-    # Count rows in USB backup (if present)
-    usb_rows = -1
-    if usb_exists:
-        try:
-            with sqlite3.connect(USB_DB_BACKUP) as usb_conn:
-                usb_rows = usb_conn.execute("SELECT COUNT(*) FROM tn").fetchone()[0]
-        except Exception:
-            logger.exception("Unable to read USB backup DB at %s", USB_DB_BACKUP)
+    # find the richest DB
+    source = max(rows, key=lambda k: rows[k])
+    src_path = paths[source]
+    src_count = rows[source]
 
-    # Count rows in local DB (if present)
-    local_rows = -1
-    if local_exists:
+    # copy source to the other two
+    for target, tgt_path in paths.items():
+        if target == source or rows[target] == src_count:
+            continue
         try:
-            with sqlite3.connect(local_db) as local_conn:
-                local_rows = local_conn.execute("SELECT COUNT(*) FROM tn").fetchone()[0]
-        except Exception:
-            logger.exception("Unable to read local DB at %s", local_db)
-
-    # Sync the richer DB to the poorer one
-    if usb_rows > local_rows:
-        # USB is more up-to-date → copy to local
-        try:
-            os.makedirs(os.path.dirname(local_db) or ".", exist_ok=True)
-            shutil.copy2(USB_DB_BACKUP, local_db)
+            os.makedirs(os.path.dirname(tgt_path) or ".", exist_ok=True)
+            shutil.copy2(src_path, tgt_path)
             logger.info(
-                "Synced local DB from USB backup: %s (local rows=%d, usb rows=%d)",
-                local_db, local_rows, usb_rows
+                "Synced %s from %s: %s → %s (rows %d → %d)",
+                target, source, src_path, tgt_path, src_count, rows[target]
             )
         except Exception:
-            logger.exception(
-                "Failed to copy USB DB %s to local %s",
-                USB_DB_BACKUP, local_db
-            )
+            logger.exception("Failed to copy DB from %s to %s", src_path, tgt_path)
 
-    elif local_rows > usb_rows:
-        # Local is more up-to-date → copy to USB
-        try:
-            os.makedirs(os.path.dirname(USB_DB_BACKUP) or ".", exist_ok=True)
-            shutil.copy2(local_db, USB_DB_BACKUP)
-            logger.info(
-                "Synced USB backup from local DB: %s (local rows=%d, usb rows=%d)",
-                USB_DB_BACKUP, local_rows, usb_rows
-            )
-        except Exception:
-            logger.exception(
-                "Failed to copy local DB %s to USB %s",
-                local_db, USB_DB_BACKUP
-            )
-
-    else:
-        # Equal row counts → assume already in sync
-        logger.debug("Databases in sync: %d rows each",
-                     local_rows)
 
 def wait_for_tag(plc: LogixDriver, tag_key: str) -> None:
     name = PLC_TAGS[tag_key]
@@ -250,6 +233,15 @@ def insert_tn_record(db_path: str, timestamp: str, finished_serial: Any,
             logger.info("Data stored in USB backup database: %s", db_path)
     except Exception as e:
         logger.error("Failed to write TN record to USB backup DB %s: %s", db_path, e)
+
+
+def replicate_tn_to_backups(timestamp: str, finished_serial: Any,
+                             lhconv: Any, rhconv: Any, status: str) -> None:
+    """
+    Write the same TN record into both USB backup databases.
+    """
+    for dbp in USB_DB_BACKUPS:
+        insert_tn_record(dbp, timestamp, finished_serial, lhconv, rhconv, status)
 
 
 def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,

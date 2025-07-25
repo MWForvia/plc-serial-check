@@ -1,0 +1,48 @@
+---
+config:
+  layout: fixed
+---
+flowchart TD
+    A["Start Replacement Process<br><br>(Raspberry pi will not boot, hardware failure)<br><br>Possible Symptom Examples:<br>1. Red Status Light<br>2. Connection Fault on PLC<br>3. Unplug power and replug and power will not turn green."] --> B["Instruction<br>Unplug old Raspberry Pi"]
+    B --> C["Instruction<br>Unplug USB1 and USB2 from the old Pi"]
+    C --> D["Instruction<br>Remove the old Pi and set it aside (unplug ethernet and power)"]
+    D --> E["Instruction<br>Install the new Raspberry Pi in the same location"]
+    E --> F["Instruction<br>Insert USB1 and USB2 into the new Pi’s USB ports"]
+    F --> G["Instruction<br>Connect power and Ethernet to the new Pi"]
+    G --> K["(Automatic)<br>Start tri-directional database sync"]
+    K --> L["(Automatic)<br>Select the database (local, USB1 or USB2) with the most rows<br><br>Local = SD Card in Raspberry Pi<br>USB1 = Gray USB Drive<br>USB2 = Red USB Drive"]
+    L --> M@{ label: "(Automatic)<br>Copy that 'richest' DB to the other two storage locations" }
+    M --> N{"(Automatic)<br>USB2 Database/Drive Corrupted?"}
+    N -- Yes --> O["(Automatic)<br>Reformat USB2 and clone a healthy DB"]
+    N -- No --> P["(Automatic)<br>All three databases are now in sync"]
+    O --> P
+    P --> Q["(Automatic)<br>System ready: continuous backups on USB1 and USB2"]
+    M@{ shape: rect}
+    style A stroke:#D50000
+    style B stroke:#2962FF
+    style C stroke:#2962FF
+    style D stroke:#2962FF
+    style E stroke:#2962FF
+    style F stroke:#2962FF
+    style G stroke:#2962FF
+    style K stroke:#AA00FF
+    style L stroke:#AA00FF
+    style M stroke:#AA00FF
+    style N stroke:#AA00FF
+    style O stroke:#AA00FF
+    style P stroke:#AA00FF
+    style Q stroke:#AA00FF
+    linkStyle 0 stroke:#D50000,fill:none
+    linkStyle 1 stroke:#2962FF,fill:none
+    linkStyle 2 stroke:#2962FF,fill:none
+    linkStyle 3 stroke:#2962FF,fill:none
+    linkStyle 4 stroke:#2962FF,fill:none
+    linkStyle 5 stroke:#2962FF,fill:none
+    linkStyle 6 stroke:#AA00FF,fill:none
+    linkStyle 7 stroke:#AA00FF,fill:none
+    linkStyle 8 stroke:#AA00FF,fill:none
+    linkStyle 9 stroke:#AA00FF,fill:none
+    linkStyle 10 stroke:#D50000
+    linkStyle 11 stroke:#00C853,fill:none
+    linkStyle 12 stroke:#00C853,fill:none
+    linkStyle 13 stroke:#AA00FF,fill:none

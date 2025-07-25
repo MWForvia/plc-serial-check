@@ -1,0 +1,58 @@
+---
+config:
+  layout: fixed
+---
+flowchart TD
+    A["Monitor &amp; Update Loop<br>(Listens to the PLC)"] --- B{"Scan Complete?"}
+    B -- Yes --> C["Read LH & RH serial numbers"]
+    C --> D{"Both serials are new?<br>(Checks scanned serial numbers against the database containing all recorded serial numbers.)"}
+    D -- Yes --> E@{ label: "Send PASS, wait for store, save 'Passed' record" }
+    D -- No --> EXC["Exceptions?"]
+    F{"Leak-Test Rerun Allowed?"} -- Yes --> G@{ label: "Send PASS, wait for store, save 'Leak-Test Rerun' record" }
+    H{"First-Piece Mode Active?"} -- Yes --> I@{ label: "Print first-piece label, send PASS, wait for store, save 'First Piece Check' record" }
+    J{"Rework Mode Selected? (HMI Button)"} -- No --> K@{ label: "Send FAIL, wait for reset,  save 'SN Duplicate Failed' record" }
+    J -- Yes --> L{"Label scanned successfully?"}
+    L -- Yes --> M{"Label & converter data match exactly one DB record?"}
+    L -- No --> P{"SN entered manually?"}
+    P -- Yes --> Q{"Manual SN & scanned converter data match DB record?"}
+    Q -- Yes --> R@{ label: "Send PASS, wait for store/reset, save 'Rework Pass' record" }
+    Q -- No --> K
+    M -- Yes --> R
+    M -- No --> K
+    H -- No --> F
+    F -- No --> J
+    EXC --- H
+    H --- CR2@{ label: "Conditions Required:<br>1)Test 'rabbit' converter serial numbers stored in plc. Scanned serials must match.<br>(First piece label will have no barcode for extra error proofing.)" }
+    F --- CR@{ label: "Conditions Required:<br>1) Exactly one prior record for these LH & RH serials with status = 'Part Failed Leaktest'<br>2) No other records for these serials with any other status" }
+    E@{ shape: rect}
+    G@{ shape: rect}
+    I@{ shape: rect}
+    K@{ shape: rect}
+    R@{ shape: rect}
+    CR@{ shape: rect}
+    style E stroke:#00C853
+    style G stroke:#00C853
+    style I stroke:#00C853
+    style K stroke:#D50000
+    style R stroke:#00C853
+    style CR2 stroke:#2962FF
+    style CR stroke:#2962FF
+    linkStyle 0 stroke:#000000,fill:none
+    linkStyle 1 stroke:#00C853,fill:none
+    linkStyle 2 stroke:#00C853,fill:none
+    linkStyle 3 stroke:#00C853,fill:none
+    linkStyle 4 stroke:#FF6D00,fill:none
+    linkStyle 5 stroke:#00C853,fill:none
+    linkStyle 6 stroke:#00C853,fill:none
+    linkStyle 7 stroke:#D50000,fill:none
+    linkStyle 8 stroke:#00C853,fill:none
+    linkStyle 9 stroke:#00C853,fill:none
+    linkStyle 10 stroke:#D50000,fill:none
+    linkStyle 11 stroke:#00C853,fill:none
+    linkStyle 12 stroke:#00C853,fill:none
+    linkStyle 13 stroke:#D50000,fill:none
+    linkStyle 14 stroke:#00C853,fill:none
+    linkStyle 15 stroke:#D50000,fill:none
+    linkStyle 16 stroke:#D50000,fill:none
+    linkStyle 18 stroke:#2962FF,fill:none
+    linkStyle 19 stroke:#2962FF,fill:none

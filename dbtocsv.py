@@ -35,7 +35,7 @@ import traceback  # keep for exception logging
 DB_PATH        = "/home/gap900/tndb900.db"
 CSV_DIR        = "/home/gap900/csv_exports"
 USB_CSV_DIR    = "/media/usbdrive/csv_exports"
-DB_BACKUP_DIRS = ["/media/usbdrive/db_backup", "/home/gap900/db_backup"]
+DB_BACKUP_DIRS = ["/media/usbdrive/db_backup", "/media/usbdrive2/db_backup", "/home/gap900/db_backup"]
 RETRY_DELAY    = 60   # seconds between retry attempts
 
 # directory where rotated logs live

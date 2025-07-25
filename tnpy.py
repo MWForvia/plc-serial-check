@@ -73,31 +73,28 @@ USB_DB_BACKUP2     = "/media/usbdrive2/db_backup/tndb900.db"
 USB_DB_BACKUPS     = [USB_DB_BACKUP, USB_DB_BACKUP2]
 
 PLC_TAGS = {
-    'PI_HEARTBEAT':    'PI_Heartbeat',
-    'LH_CONV':         'FIX_513D.Conv_Barcode.EXTRACT[2]',
-    'RH_CONV':         'FIX_513D.Conv_Barcode_R.EXTRACT[2]',
-    'DATASTORE':       'FIX_513D.Seq.Data_Store',
-    'SEQ_STEP':        'SEQUENCE_STEP',
-    'FINISHED_SERIAL': 'ZEBRA.Working_String[20]',
-    'SCAN_COMPLETE':   'FIX_513D.Seq.Conv_Barcode_Passed',
-    'TN_CHECK_PASS':   'TN_Check_Pass',
-    'TN_CHECK_FAIL':   'TN_Check_Fail',
-    'TN_DB_ERROR':     'TN_DB_Error',
-    'PART_FAIL':       'FIX_513D.Seq.Part_Failed[0]',
-    'LEAK_TEST_FAIL':  'FIX_513D.Seq.Leak_Test_Failed',
-    'FIRST_PIECE_CHECK':'FIRST_PIECE_CHECK'
+    'PI_HEARTBEAT':          'PI_Heartbeat',
+    'LH_CONV':               'FIX_513D.Conv_Barcode.EXTRACT[2]',
+    'RH_CONV':               'FIX_513D.Conv_Barcode_R.EXTRACT[2]',
+    'DATASTORE':             'FIX_513D.Seq.Data_Store',
+    'SEQ_STEP':              'SEQUENCE_STEP',
+    'FINISHED_SERIAL':       'ZEBRA.Working_String[20]',
+    'SCAN_COMPLETE':         'FIX_513D.Seq.Conv_Barcode_Passed',
+    'TN_CHECK_PASS':         'TN_Check_Pass',
+    'TN_CHECK_FAIL':         'TN_Check_Fail',
+    'TN_DB_ERROR':           'TN_DB_Error',
+    'PART_FAIL':             'FIX_513D.Seq.Part_Failed[0]',
+    'LEAK_TEST_FAIL':        'FIX_513D.Seq.Leak_Test_Failed',
+    'FIRST_PIECE_CHECK':     'FIRST_PIECE_CHECK',
+    'REWORK_MODE':           'REWORK_MODE',
+    'REWORK_LABEL_DATE':     'REWORK_LABEL_DATE',
+    'REWORK_LABEL_FINISHED': 'REWORK_LABEL_FINISHED',
+    'REWORK_LABEL_LH':       'REWORK_LABEL_LH',
+    'REWORK_LABEL_RH':       'REWORK_LABEL_RH',
+    'TLA_SN_PASS':           'TLA_SN_PASS',
+    'TN_TLA_SN_CHECK_PASS':  'TN_TLA_SN_CHECK_PASS',
+    'SERIAL_HOLDER':         'ZEBRA.Working_String[20]',
 }
-
-PLC_TAGS.update({
-    'REWORK_MODE':            'REWORK_MODE',
-    'REWORK_LABEL_DATE':      'REWORK_LABEL_DATE',
-    'REWORK_LABEL_FINISHED':  'REWORK_LABEL_FINISHED',
-    'REWORK_LABEL_LH':        'REWORK_LABEL_LH',
-    'REWORK_LABEL_RH':        'REWORK_LABEL_RH',
-    'TLA_SN_PASS':            'TLA_SN_PASS',
-    'TN_TLA_SN_CHECK_PASS':   'TN_TLA_SN_CHECK_PASS',
-    'SERIAL_HOLDER':          'ZEBRA.Working_String[20]',
-})
 
 SQL_STATEMENTS = {
     'insert_tn': (

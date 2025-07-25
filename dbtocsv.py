@@ -35,6 +35,7 @@ import traceback  # keep for exception logging
 DB_PATH        = "/home/gap900/tndb900.db"
 CSV_DIR        = "/home/gap900/csv_exports"
 USB_CSV_DIR    = "/media/usbdrive/csv_exports"
+USB2_CSV_DIR  = "/media/usbdrive2/csv_exports"
 DB_BACKUP_DIRS = ["/media/usbdrive/db_backup", "/media/usbdrive2/db_backup", "/home/gap900/db_backup"]
 RETRY_DELAY    = 60   # seconds between retry attempts
 
@@ -98,7 +99,7 @@ def export_csv() -> None:
             logger.debug("No entries to export.")
             return
 
-        for target_dir in (CSV_DIR, USB_CSV_DIR):
+        for target_dir in (CSV_DIR, USB_CSV_DIR, USB2_CSV_DIR):
             path = Path(target_dir) / filename
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, mode="w", newline="") as f:

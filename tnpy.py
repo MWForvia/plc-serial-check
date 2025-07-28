@@ -31,11 +31,11 @@ from typing import Any
 from datetime import datetime, timedelta
 
 # --- Logging setup ---
-log_dir = Path.home() / "tnpy_logs"
+log_dir = Path.home() / "tnpy_logs900"
 log_dir.mkdir(parents=True, exist_ok=True)
 
 # INFO handler
-info_log = Path.home() / "tnpy.log"
+info_log = Path.home() / "tnpy900.log"
 info_handler = TimedRotatingFileHandler(
     filename=str(info_log), when="midnight", interval=1, backupCount=0
 )
@@ -45,7 +45,7 @@ info_handler.setLevel(logging.INFO)
 info_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 
 # DEBUG handler
-debug_log = Path.home() / "tnpy_debug.log"
+debug_log = Path.home() / "tnpy_debug900.log"
 debug_handler = TimedRotatingFileHandler(
     filename=str(debug_log), when="midnight", interval=1, backupCount=0
 )
@@ -68,8 +68,8 @@ except ImportError as e:
 
 # --- Constants ---
 default_local_db   = "/home/gap900/tndb900.db"
-USB_DB_BACKUP      = "/media/usbdrive/db_backup/tndb900.db"
-USB_DB_BACKUP2     = "/media/usbdrive2/db_backup/tndb900.db"
+USB_DB_BACKUP      = "/media/usbdrive/db_backup900/tndb900.db"
+USB_DB_BACKUP2     = "/media/usbdrive2/db_backup900/tndb900.db"
 USB_DB_BACKUPS     = [USB_DB_BACKUP, USB_DB_BACKUP2]
 
 PLC_TAGS = {

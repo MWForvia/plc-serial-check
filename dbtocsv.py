@@ -33,21 +33,21 @@ import traceback  # keep for exception logging
 
 # Configuration
 DB_PATH        = "/home/gap900/tndb900.db"
-CSV_DIR        = "/home/gap900/csv_exports"
-USB_CSV_DIR    = "/media/usbdrive/csv_exports"
-USB2_CSV_DIR  = "/media/usbdrive2/csv_exports"
-DB_BACKUP_DIRS = ["/media/usbdrive/db_backup", "/media/usbdrive2/db_backup", "/home/gap900/db_backup"]
+CSV_DIR        = "/home/gap900/csv_exports900"
+USB_CSV_DIR    = "/media/usbdrive/csv_exports900"
+USB2_CSV_DIR   = "/media/usbdrive2/csv_exports900"
+DB_BACKUP_DIRS = ["/media/usbdrive/db_backup900", "/media/usbdrive2/db_backup900", "/home/gap900/db_backup900"]
 RETRY_DELAY    = 60   # seconds between retry attempts
 
 # directory where rotated logs live
-LOG_BACKUP_DIR = Path.home() / "dbtocsv_logs"
+LOG_BACKUP_DIR = Path.home() / "dbtocsv_logs900"
 LOG_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
 # Setup logging: active log at ~/dbtocsv.log, rotated daily into ~/dbtocsv_logs
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
 # INFO handler: only file‐save successes
-info_log     = Path.home() / "dbtocsv.log"
+info_log     = Path.home() / "dbtocsv900.log"
 info_handler = TimedRotatingFileHandler(
     filename=str(info_log),
     when="midnight",
@@ -60,7 +60,7 @@ info_handler.setLevel  (logging.INFO)
 info_handler.setFormatter(formatter)
 
 # DEBUG handler: all other statuses, retries, errors
-debug_log     = Path.home() / "dbtocsv_debug.log"
+debug_log     = Path.home() / "dbtocsv_debug900.log"
 debug_handler = TimedRotatingFileHandler(
     filename=str(debug_log),
     when="midnight",

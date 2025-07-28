@@ -1,0 +1,43 @@
+---
+config:
+  layout: fixed
+---
+flowchart TD
+    B{"Scan Complete?"} -- Yes --> C["Read LH & RH serial numbers"]
+    C --> D{"Both serials are new?<br>(Checks scanned serial numbers against the database containing all recorded serial numbers.)"}
+    D -- Yes --> E@{ label: "Send PASS, wait for store, save 'Passed' record" }
+    D -- No --> EXC["Exceptions?"]
+    J{"Rework Mode Selected? (HMI Button)"} -- No --> K@{ label: "Send FAIL, wait for reset,  save 'SN Duplicate Failed' record" }
+    J -- Yes --> L{"Label scanned successfully?"}
+    L -- Yes --> M{"Label & converter data match exactly one DB record?"}
+    L -- No --> P{"SN entered manually?"}
+    P -- Yes --> Q{"Manual SN & scanned converter data match DB record?"}
+    Q -- Yes --> R@{ label: "Send PASS, wait for store/reset, save 'Rework Pass' record" }
+    Q -- No --> K
+    M -- Yes --> R
+    M -- No --> K
+    EXC -- No manual overrides --> J
+    A["Monitor &amp; Update Loop<br>(Listens to the PLC)"] <--> B
+    n1["T1xx SuV - GAP 300 - Serial Number PKYK Function Flowchart"]
+    E@{ shape: rect}
+    K@{ shape: rect}
+    R@{ shape: rect}
+    n1@{ shape: text}
+    style E stroke:#00C853
+    style K stroke:#D50000
+    style R stroke:#00C853
+    style n1 font-size:24px,font-weight:bold
+    linkStyle 0 stroke:#00C853,fill:none
+    linkStyle 1 stroke:#00C853,fill:none
+    linkStyle 2 stroke:#00C853,fill:none
+    linkStyle 3 stroke:#FFD600,fill:none
+    linkStyle 4 stroke:#D50000,fill:none
+    linkStyle 5 stroke:#00C853,fill:none
+    linkStyle 6 stroke:#00C853,fill:none
+    linkStyle 7 stroke:#D50000,fill:none
+    linkStyle 8 stroke:#00C853,fill:none
+    linkStyle 9 stroke:#00C853,fill:none
+    linkStyle 10 stroke:#D50000,fill:none
+    linkStyle 11 stroke:#00C853,fill:none
+    linkStyle 12 stroke:#D50000,fill:none
+    linkStyle 13 stroke:#FFD600,fill:none

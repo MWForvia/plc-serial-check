@@ -1,19 +1,30 @@
 #!/usr/bin/env python3
-"""
-tnpy.py
+"""tnpy300.py
 
-This script pulls the serial numbers scanned from the LH and RH converter and compares them to a historical database.
+This script pulls the serial numbers scanned from the LH and RH converters and compares them to a historical database.
 It returns if they are a repeat or not, then adds the data to the db.
 
-Database: tndb900.db
+Database: tndb300.db
 Table: tn
 Schema:
     id integer primary key autoincrement,
     date text,
-    finished_serial text,
-    component_serial1 text,
-    component_serial2 text,
-    status TEXT
+    tla1_pn text,
+    tla1_tn text,
+    tla1_vpps text,
+    tla1_duns text,
+    conv1_pn text,
+    conv1_tn text,
+    conv1_vpps text,
+    conv1_duns text,
+    tla2_pn text,
+    tla2_tn text,
+    tla2_vpps text,
+    tla2_duns text,
+    conv2_pn text,
+    conv2_tn text,
+    conv2_vpps text,
+    conv2_duns text
 """
 
 import argparse
@@ -67,41 +78,68 @@ except ImportError as e:
     sys.exit(1)
 
 # --- Constants ---
-default_local_db   = "/home/gap900/tndb900.db"
-USB_DB_BACKUP      = "/media/usbdrive/db_backup/tndb900.db"
-USB_DB_BACKUP2     = "/media/usbdrive2/db_backup/tndb900.db"
+default_local_db   = "/home/gap300/tndb300.db"
+USB_DB_BACKUP      = "/media/usbdrive/db_backup/tndb300.db"
+USB_DB_BACKUP2     = "/media/usbdrive2/db_backup/tndb300.db"
 USB_DB_BACKUPS     = [USB_DB_BACKUP, USB_DB_BACKUP2]
 
 PLC_TAGS = {
+    # Heartbeat and control tags
     'PI_HEARTBEAT':          'PI_Heartbeat',
-    'LH_CONV':               'FIX_513D.Conv_Barcode.EXTRACT[2]',
-    'RH_CONV':               'FIX_513D.Conv_Barcode_R.EXTRACT[2]',
-    'DATASTORE':             'FIX_513D.Seq.Data_Store',
-    'SEQ_STEP':              'SEQUENCE_STEP',
-    'FINISHED_SERIAL':       'ZEBRA.Working_String[20]',
-    'SCAN_COMPLETE':         'FIX_513D.Seq.Conv_Barcode_Passed',
-    'TN_CHECK_PASS':         'TN_Check_Pass',
-    'TN_CHECK_FAIL':         'TN_Check_Fail',
-    'TN_DB_ERROR':           'TN_DB_Error',
-    'PART_FAIL':             'FIX_513D.Seq.Part_Failed[0]',
-    'LEAK_TEST_FAIL':        'FIX_513D.Seq.Leak_Test_Failed',
-    'FIRST_PIECE_CHECK':     'FIRST_PIECE_CHECK',
     'REWORK_MODE':           'REWORK_MODE',
     'REWORK_LABEL_DATE':     'REWORK_LABEL_DATE',
     'REWORK_LABEL_FINISHED': 'REWORK_LABEL_FINISHED',
     'REWORK_LABEL_LH':       'REWORK_LABEL_LH',
     'REWORK_LABEL_RH':       'REWORK_LABEL_RH',
     'TLA_SN_PASS':           'TLA_SN_PASS',
-    'TN_TLA_SN_CHECK_PASS':  'TN_TLA_SN_CHECK_PASS',
-    'SERIAL_HOLDER':         'ZEBRA.Working_String[20]',
+    'TN_CHECK_PASS':         'TN_Check_Pass',
+    'TN_CHECK_FAIL':         'TN_Check_Fail',
+    'TN_DB_ERROR':           'TN_DB_Error',
+    # Data fields in DB order
+    'TLA1_PN':               'PN.C2_TLA1_PN',
+    'TLA1_TN':               'PN.C2_TLA1_TN',
+    'TLA1_VPPS':             'PN.C2_TLA1_VPPS',
+    'TLA1_DUNS':             'PN.C2_TLA1_DUNS',
+    'CONV1_PN':              'PN.C2_CONV1_PN',
+    'CONV1_TN':              'PN.C2_CONV1_TN',
+    'CONV1_VPPS':            'PN.C2_CONV1_VPPS',
+    'CONV1_DUNS':            'PN.C2_CONV1_DUNS',
+    'TLA2_PN':               'PN.C2_TLA2_PN',
+    'TLA2_TN':               'PN.C2_TLA2_TN',
+    'TLA2_VPPS':             'PN.C2_TLA2_VPPS',
+    'TLA2_DUNS':             'PN.C2_TLA2_DUNS',
+    'CONV2_PN':              'PN.C2_CONV2_PN',
+    'CONV2_TN':              'PN.C2_CONV2_TN',
+    'CONV2_VPPS':            'PN.C2_CONV2_VPPS',
+    'CONV2_DUNS':            'PN.C2_CONV2_DUNS',
+    # Control & sequence tags
+    'SCAN_COMPLETE':         'HScan.Good',
+    'PART_FAIL':             'Z_Torque_Gun:I.Data[0].3',
+    'DATASTORE':             'Data.CMD_Record',
+    'SEQ_STEP':              'Local_Step_II_N',
 }
 
 SQL_STATEMENTS = {
     'insert_tn': (
-        "INSERT INTO tn (date, finished_serial, component_serial1, component_serial2, status) "
-        "VALUES (?, ?, ?, ?, ?)"
+        "INSERT INTO tn (date, tla1_pn, tla1_tn, tla1_vpps, tla1_duns, "
+        "conv1_pn, conv1_tn, conv1_vpps, conv1_duns, "
+        "tla2_pn, tla2_tn, tla2_vpps, tla2_duns, "
+        "conv2_pn, conv2_tn, conv2_vpps, conv2_duns) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
 }
+# order of PLC tags matching DB columns (tla1_pn,...,conv2_duns)
+INSERT_FIELDS = [
+    'TLA1_PN','TLA1_TN','TLA1_VPPS','TLA1_DUNS',
+    'CONV1_PN','CONV1_TN','CONV1_VPPS','CONV1_DUNS',
+    'TLA2_PN','TLA2_TN','TLA2_VPPS','TLA2_DUNS',
+    'CONV2_PN','CONV2_TN','CONV2_VPPS','CONV2_DUNS'
+]
+def read_insert_fields(plc):
+    """
+    Read all PN/TN/VPPS/DUNS tags in schema order and return a list of values.
+    """
+    return [plc.read(PLC_TAGS[key]).value for key in INSERT_FIELDS]
 
 POLL_INTERVAL      = 0.5   # general polling interval
 FAST_POLL_INTERVAL = 0.1   # fast polling for fail/datastore
@@ -264,85 +302,54 @@ def check_converter_sn(cursor: sqlite3.Cursor, column: str, sn: Any, label: str)
     return True
 
 
-def is_leaktest_rerun_allowed(cursor: sqlite3.Cursor, lhconv: Any, rhconv: Any) -> bool:
-    cursor.execute(
-        "SELECT COUNT(*) FROM tn WHERE component_serial1=? AND component_serial2=? AND status='Part Failed Leaktest'",
-        (lhconv, rhconv)
-    )
-    if cursor.fetchone()[0] != 1:
-        return False
-    cursor.execute(
-        "SELECT COUNT(*) FROM tn WHERE (component_serial1=? OR component_serial2=?) AND status!='Part Failed Leaktest'",
-        (lhconv, rhconv)
-    )
-    return cursor.fetchone()[0] == 0
-
-
 def set_pass(plc: LogixDriver, passed: bool) -> None:
     plc.write((PLC_TAGS['TN_CHECK_PASS'], passed))
     plc.write((PLC_TAGS['TN_CHECK_FAIL'], not passed))
 
 
-def insert_tn_record(db_path: str, timestamp: str, finished_serial: Any,
-                     lhconv: Any, rhconv: Any, status: str) -> None:
+def insert_tn_record(db_path: str, record_values: list) -> None:
     try:
         with sqlite3.connect(db_path) as conn2:
             cur2 = conn2.cursor()
-            cur2.execute(SQL_STATEMENTS['insert_tn'],
-                         (timestamp, finished_serial, lhconv, rhconv, status))
+            cur2.execute(SQL_STATEMENTS['insert_tn'], record_values)
             conn2.commit()
             logger.info("Data stored in USB backup database: %s", db_path)
     except Exception as e:
         logger.error("Failed to write TN record to USB backup DB %s: %s", db_path, e)
 
 
-def replicate_tn_to_backups(timestamp: str, finished_serial: Any,
-                             lhconv: Any, rhconv: Any, status: str) -> None:
+def replicate_tn_to_backups(record_values: list) -> None:
     """
     Write the same TN record into both USB backup databases.
     """
     for dbp in USB_DB_BACKUPS:
-        insert_tn_record(dbp, timestamp, finished_serial, lhconv, rhconv, status)
+        insert_tn_record(dbp, record_values)
 
 
 def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
                 cursor: sqlite3.Cursor, lhconv: Any, rhconv: Any) -> None:
-    # 1) Leak-test failure branch
-    leak = plc.read(PLC_TAGS['LEAK_TEST_FAIL'])
-    if leak and leak.value:
-        status = "Part Failed Leaktest"
-        logger.error(status)
-        if wait_for_fail_or_reset(plc):
-            ts = time.strftime('%Y-%m-%d %H:%M:%S')
-            cursor.execute(SQL_STATEMENTS['insert_tn'],
-                           (ts, 'N/A', lhconv, rhconv, status))
-            cursor.connection.commit()
-            logger.error("Leak Test Failed - Data stored in database")
-            insert_tn_record(USB_DB_BACKUP, ts, 'N/A', lhconv, rhconv, status)
-        return
-
-    # 2) Duplicate-SN logic
+    # 1) Duplicate-SN logic
     if not lh_pass and not rh_pass:
         base_status = "LH & RH SN Dupe - Failed"
         cursor.execute(
-            "SELECT finished_serial FROM tn "
-            "WHERE component_serial1=? OR component_serial2=? "
+            "SELECT tla1_tn FROM tn "
+            "WHERE conv1_tn=? OR conv2_tn=? "
             "ORDER BY id ASC LIMIT 1",
             (lhconv, rhconv)
         )
     elif not lh_pass:
         base_status = "LH SN Dupe - Failed"
         cursor.execute(
-            "SELECT finished_serial FROM tn "
-            "WHERE component_serial1=? "
+            "SELECT tla1_tn FROM tn "
+            "WHERE conv1_tn=? "
             "ORDER BY id ASC LIMIT 1",
             (lhconv,)
         )
     else:
         base_status = "RH SN Dupe - Failed"
         cursor.execute(
-            "SELECT finished_serial FROM tn "
-            "WHERE component_serial2=? "
+            "SELECT tla1_tn FROM tn "
+            "WHERE conv2_tn=? "
             "ORDER BY id ASC LIMIT 1",
             (rhconv,)
         )
@@ -353,11 +360,12 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
     logger.error(status)
     if wait_for_fail_or_reset(plc):
         ts = time.strftime('%Y-%m-%d %H:%M:%S')
-        cursor.execute(SQL_STATEMENTS['insert_tn'],
-                       (ts, 'N/A', lhconv, rhconv, status))
+        cursor.execute(SQL_STATEMENTS['insert_tn'], [ts] + read_insert_fields(plc))
         cursor.connection.commit()
         logger.error("Failed TN Check - Data stored in database")
-        insert_tn_record(USB_DB_BACKUP, ts, 'N/A', lhconv, rhconv, status)
+        # replicate full failed record to USB backups
+        record_values = [ts] + read_insert_fields(plc)
+        replicate_tn_to_backups(record_values)
 
 
 def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
@@ -385,47 +393,22 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                     wait_for_tag(plc, 'SCAN_COMPLETE')
                     with sqlite3.connect(db_file) as conn:
                         cursor = conn.cursor()
-                        lhconv = plc.read(PLC_TAGS['LH_CONV']).value
-                        rhconv = plc.read(PLC_TAGS['RH_CONV']).value
-
-                        # 0) First-piece check
-                        fpc = plc.read(PLC_TAGS['FIRST_PIECE_CHECK'])
-                        if fpc and fpc.value:
-                            logger.info("First Piece Check - test part detected")
-                            set_pass(plc, True)
-                            if wait_for_datastore_or_reset(plc):
-                                finished_serial = plc.read(PLC_TAGS['FINISHED_SERIAL']).value
-                                ts = time.strftime('%Y-%m-%d %H:%M:%S')
-                                cursor.execute(SQL_STATEMENTS['insert_tn'],
-                                               (ts, finished_serial, lhconv, rhconv,
-                                                'First Piece Check'))
-                                conn.commit()
-                                logger.info("Data stored in local database (First Piece Check)")
-                                insert_tn_record(USB_DB_BACKUP, ts, finished_serial,
-                                                 lhconv, rhconv, 'First Piece Check')
+                        # read converter SNs with error handling
+                        try:
+                            res_lh = plc.read(PLC_TAGS['CONV1_TN'])
+                            res_rh = plc.read(PLC_TAGS['CONV2_TN'])
+                        except CommError as e:
+                            logger.error("PLC read error: %s", e)
                             continue
 
-                        # 1) Leak-test rerun logic
-                        if is_leaktest_rerun_allowed(cursor, lhconv, rhconv):
-                            logger.info(
-                                "Rerun allowed for LH=%s, RH=%s due to previous leak test failure.",
-                                lhconv, rhconv
-                            )
-                            set_pass(plc, True)
-                            if wait_for_datastore_or_reset(plc):
-                                finished_serial = plc.read(PLC_TAGS['FINISHED_SERIAL']).value
-                                ts = time.strftime('%Y-%m-%d %H:%M:%S')
-                                cursor.execute(SQL_STATEMENTS['insert_tn'],
-                                               (ts, finished_serial, lhconv, rhconv,
-                                                'Passed - Previously failed leak test.'))
-                                conn.commit()
-                                logger.info("Data stored in local database (Leak Test Rerun)")
-                                insert_tn_record(USB_DB_BACKUP, ts, finished_serial,
-                                                 lhconv, rhconv,
-                                                 'Passed - Previously failed leak test.')
+                        if not res_lh or not res_rh or res_lh.value is None or res_rh.value is None:
+                            logger.error("Invalid converter SN read – LH=%s, RH=%s", res_lh, res_rh)
                             continue
 
-                        # 2) Rework Mode
+                        lhconv = res_lh.value
+                        rhconv = res_rh.value
+
+                        # 0) Rework Mode
                         rework = plc.read(PLC_TAGS['REWORK_MODE'])
                         if rework and rework.value:
                             # helper: poll a PLC tag until it returns a non-empty string
@@ -457,9 +440,9 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             cursor.execute(
                                 "SELECT id FROM tn "
                                 "WHERE substr(date,1,10) = ? "
-                                "  AND finished_serial = ? "
-                                "  AND component_serial1 = ? "
-                                "  AND component_serial2 = ?",
+                                "  AND tla1_tn = ? "
+                                "  AND conv1_tn = ? "
+                                "  AND conv2_tn = ?",
                                 (label_date, label_fs, label_lh, label_rh)
                             )
                             row = cursor.fetchone()
@@ -469,17 +452,17 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                 row_id = row[0]
                                 # ensure none of those SNs appear in any other row
                                 cursor.execute(
-                                    "SELECT COUNT(*) FROM tn WHERE finished_serial = ? AND id != ?",
+                                    "SELECT COUNT(*) FROM tn WHERE tla1_tn = ? AND id != ?",
                                     (label_fs, row_id)
                                 )
                                 fs_dup = cursor.fetchone()[0]
                                 cursor.execute(
-                                    "SELECT COUNT(*) FROM tn WHERE component_serial1 = ? AND id != ?",
+                                    "SELECT COUNT(*) FROM tn WHERE conv1_tn = ? AND id != ?",
                                     (label_lh, row_id)
                                 )
                                 lh_dup = cursor.fetchone()[0]
                                 cursor.execute(
-                                    "SELECT COUNT(*) FROM tn WHERE component_serial2 = ? AND id != ?",
+                                    "SELECT COUNT(*) FROM tn WHERE conv2_tn = ? AND id != ?",
                                     (label_rh, row_id)
                                 )
                                 rh_dup = cursor.fetchone()[0]
@@ -500,15 +483,12 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                 set_pass(plc, True)
                                 if wait_for_datastore_or_reset(plc):
                                     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                                    cursor.execute(
-                                        SQL_STATEMENTS['insert_tn'],
-                                        (ts, label_fs, label_lh, label_rh, 'Rework Pass')
-                                    )
+                                    cursor.execute(SQL_STATEMENTS['insert_tn'], [ts] + read_insert_fields(plc))
                                     conn.commit()
                                     logger.info("Data stored in local DB (Rework Pass)")
-                                    insert_tn_record(
-                                        USB_DB_BACKUP, ts, label_fs, label_lh, label_rh, 'Rework Pass'
-                                    )
+                                    # replicate full rework-pass record to USB backups
+                                    record_values = [ts] + read_insert_fields(plc)
+                                    replicate_tn_to_backups(record_values)
                             else:
                                 logger.error(
                                     "Rework Fail: label data date=%s, fs=%s, lh=%s, rh=%s",
@@ -517,73 +497,34 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                 set_pass(plc, False)
                                 if wait_for_fail_or_reset(plc):
                                     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                                    cursor.execute(
-                                        SQL_STATEMENTS['insert_tn'],
-                                        (ts, 'N/A', label_lh, label_rh, 'Rework Fail')
-                                    )
+                                    cursor.execute(SQL_STATEMENTS['insert_tn'], [ts] + read_insert_fields(plc))
                                     conn.commit()
                                     logger.error("Data stored in local DB (Rework Fail)")
-                                    insert_tn_record(
-                                        USB_DB_BACKUP, ts, 'N/A', label_lh, label_rh, 'Rework Fail'
-                                    )
+                                    # replicate full rework-fail record to USB backups
+                                    record_values = [ts] + read_insert_fields(plc)
+                                    replicate_tn_to_backups(record_values)
                             continue
 
-                        # 3) Normal pass / fail
-                        lh_pass = check_converter_sn(cursor, 'component_serial1', lhconv, 'LH')
-                        rh_pass = check_converter_sn(cursor, 'component_serial2', rhconv, 'RH')
+                        # 1) Normal pass / fail
+                        lh_pass = check_converter_sn(cursor, 'conv1_tn', lhconv, 'LH')
+                        rh_pass = check_converter_sn(cursor, 'conv2_tn', rhconv, 'RH')
 
                         if lh_pass and rh_pass:
                             set_pass(plc, True)
                             if wait_for_datastore_or_reset(plc):
-                                # If we're at step 143, enforce unique finished_serial
-                                if plc.read(PLC_TAGS['SEQ_STEP']).value == 143:
-                                    while True:
-                                        raw_fs = plc.read(PLC_TAGS['SERIAL_HOLDER']).value or ""
-                                        tla_sn = raw_fs[1:] if raw_fs.startswith('T') else raw_fs
-
-                                        cursor.execute(
-                                            "SELECT COUNT(*) FROM tn WHERE finished_serial = ?",
-                                            (tla_sn,)
-                                        )
-                                        dup_count = cursor.fetchone()[0]
-                                        if dup_count == 0:
-                                            # unique—pass the TLA_SN check
-                                            plc.write((PLC_TAGS['TN_TLA_SN_CHECK_PASS'], True))
-                                            logger.info(
-                                                "TN_TLA_SN_CHECK_PASS=1 for serial %s", tla_sn
-                                            )
-                                            finished_serial = tla_sn
-                                            break
-
-                                        # duplicate—bump the PLC serial counter
-                                        part_sel = plc.read("FIX_513D.Part_Select").value
-                                        serial_tag = f"FIX_513D.Serial_Number[{part_sel}]"
-                                        curr = plc.read(serial_tag).value or 0
-                                        plc.write((serial_tag, curr + 1))
-                                        logger.info(
-                                            "Incremented %s to %d", serial_tag, curr + 1
-                                        )
-
-                                else:
-                                    # non‐143 steps: just read the finished serial
-                                    finished_serial = plc.read(
-                                        PLC_TAGS['FINISHED_SERIAL']
-                                    ).value
+                                # Always read the finished serial directly (no unique SN increment)
+                                finished_serial = plc.read(PLC_TAGS['FINISHED_SERIAL']).value
 
                                 ts = time.strftime('%Y-%m-%d %H:%M:%S')
                                 # insert into local DB
-                                cursor.execute(
-                                    SQL_STATEMENTS['insert_tn'],
-                                    (ts, finished_serial, lhconv, rhconv, 'Passed')
-                                )
+                                cursor.execute(SQL_STATEMENTS['insert_tn'], [ts] + read_insert_fields(plc))
                                 conn.commit()
                                 logger.info("Data stored in local database (Passed)")
 
                                 # replicate to USB
-                                insert_tn_record(
-                                    USB_DB_BACKUP,
-                                    ts, finished_serial, lhconv, rhconv, 'Passed'
-                                )
+                                # replicate full passed record to USB backups
+                                record_values = [ts] + read_insert_fields(plc)
+                                replicate_tn_to_backups(record_values)
 
                                 # final PLC pass‐flag for TLA_SN
                                 # (optional: leave TLA_SN_PASS driven by DUP logic above)
@@ -615,7 +556,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="TN barcode converter serial checker")
-    parser.add_argument("--plc", default="10.131.201.60", help="PLC IP address")
+    parser.add_argument("--plc", default="192.168.1.1", help="PLC IP address")
     parser.add_argument("--db", default=default_local_db, help="Path to SQLite DB file")
     args = parser.parse_args()
 

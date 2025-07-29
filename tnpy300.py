@@ -41,12 +41,16 @@ from pathlib import Path
 from typing import Any
 from datetime import datetime, timedelta
 
+# Helper to detect real mount
+def is_mounted(path: str) -> bool:
+    return os.path.ismount(os.path.dirname(path))
+
 # --- Logging setup ---
-log_dir = Path.home() / "tnpy_logs"
+log_dir = Path.home() / "tnpy_logs300"
 log_dir.mkdir(parents=True, exist_ok=True)
 
 # INFO handler
-info_log = Path.home() / "tnpy.log"
+info_log = Path.home() / "tnpy300.log"
 info_handler = TimedRotatingFileHandler(
     filename=str(info_log), when="midnight", interval=1, backupCount=0
 )
@@ -56,7 +60,7 @@ info_handler.setLevel(logging.INFO)
 info_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 
 # DEBUG handler
-debug_log = Path.home() / "tnpy_debug.log"
+debug_log = Path.home() / "tnpy300_debug.log"
 debug_handler = TimedRotatingFileHandler(
     filename=str(debug_log), when="midnight", interval=1, backupCount=0
 )
@@ -139,7 +143,14 @@ def read_insert_fields(plc):
     """
     Read all PN/TN/VPPS/DUNS tags in schema order and return a list of values.
     """
-    return [plc.read(PLC_TAGS[key]).value for key in INSERT_FIELDS]
+    # read fields and validate non-empty
+    vals = [plc.read(PLC_TAGS[key]).value for key in INSERT_FIELDS]
+    if any(v is None or (isinstance(v, str) and not v.strip()) for v in vals):
+        try:
+            plc.write((PLC_TAGS['TN_DB_ERROR'], True))
+        except Exception:
+            pass
+    return vals
 
 POLL_INTERVAL      = 0.5   # general polling interval
 FAST_POLL_INTERVAL = 0.1   # fast polling for fail/datastore
@@ -193,9 +204,9 @@ def sync_db_from_backup(local_db: str) -> None:
     Tri‐directional sync: pick the DB (local, USB1 or USB2) with the most rows
     and copy it over the other two, so the richest DB is the source‐of‐truth.
     """
-    # --- Health check USB2 only; if corrupted, reformat & clone from local or USB1 ---
-    usb2 = USB_DB_BACKUP2
-    if os.path.exists(usb2) and not check_db_integrity(usb2):
+    # --- Auto-repair USB stick 1 only; skip USB2 auto-format ---
+    usb1 = USB_DB_BACKUP
+    if os.path.exists(usb1) and not check_db_integrity(usb1):
         # choose a healthy source: prefer local, else USB1
         healthy = None
         if os.path.exists(local_db) and check_db_integrity(local_db):
@@ -204,15 +215,15 @@ def sync_db_from_backup(local_db: str) -> None:
             healthy = USB_DB_BACKUP
 
         if healthy:
-            logger.warning("Repairing corrupted USB2 DB at %s from %s", usb2, healthy)
-            mount_pt = os.path.dirname(usb2)
+            logger.warning("Repairing corrupted USB1 DB at %s from %s", usb1, healthy)
+            mount_pt = os.path.dirname(usb1)
             reformat_usb(mount_pt)
             os.makedirs(mount_pt, exist_ok=True)
-            shutil.copy2(healthy, usb2)
-            logger.info("Cloned %s → %s", healthy, usb2)
+            shutil.copy2(healthy, usb1)
+            logger.info("Cloned %s → %s", healthy, usb1)
         else:
             logger.critical(
-                "No healthy source to repair corrupted USB2 DB at %s", usb2
+                "No healthy source to repair corrupted USB1 DB at %s", usb1
             )
 
     # --- count rows in local, USB1, USB2 and sync richest → others ---
@@ -231,6 +242,12 @@ def sync_db_from_backup(local_db: str) -> None:
             except Exception:
                 rows[name] = -1
                 logger.exception("Unable to read DB at %s", p)
+                # flag DB error on read failure
+                try:
+                    plc_main = globals().get('plc')
+                    plc_main.write((PLC_TAGS['TN_DB_ERROR'], True))
+                except Exception:
+                    pass
         else:
             rows[name] = -1
 
@@ -245,6 +262,10 @@ def sync_db_from_backup(local_db: str) -> None:
 
     # copy source to the other two
     for target, tgt_path in paths.items():
+        # skip unmounted USB sync targets
+        if tgt_path.startswith("/media") and not is_mounted(tgt_path):
+            logger.debug(f"Skipping DB sync to unmounted {tgt_path}")
+            continue
         if target == source or rows[target] == src_count:
             continue
         try:
@@ -256,18 +277,29 @@ def sync_db_from_backup(local_db: str) -> None:
             )
         except Exception:
             logger.exception("Failed to copy DB from %s to %s", src_path, tgt_path)
+            # flag DB error on copy failure
+            try: plc_main = globals().get('plc'); plc_main.write((PLC_TAGS['TN_DB_ERROR'], True))
+            except: pass
 
 
 def wait_for_tag(plc: LogixDriver, tag_key: str) -> None:
     name = PLC_TAGS[tag_key]
     # wait for false→true transition
     while True:
+        # exit on reset
+        rs = plc.read(PLC_TAGS['SEQ_STEP'])
+        if rs and rs.value == 0:
+            return
         val = plc.read(name)
         if val and not val.value:
             break
         time.sleep(POLL_INTERVAL)
     # then true
     while True:
+        # exit on reset
+        rs = plc.read(PLC_TAGS['SEQ_STEP'])
+        if rs and rs.value == 0:
+            return
         val = plc.read(name)
         if val and val.value:
             return
@@ -287,6 +319,10 @@ def wait_for_datastore_or_reset(plc: LogixDriver) -> bool:
 
 def wait_for_fail_or_reset(plc: LogixDriver) -> bool:
     while True:
+        # exit on reset
+        rs = plc.read(PLC_TAGS['SEQ_STEP'])
+        if rs and rs.value == 0:
+            return False
         fl = plc.read(PLC_TAGS['PART_FAIL'])
         if fl and fl.value:
             return True
@@ -308,14 +344,34 @@ def set_pass(plc: LogixDriver, passed: bool) -> None:
 
 
 def insert_tn_record(db_path: str, record_values: list) -> None:
+    # skip writes to unmounted USB backup DBs
+    if db_path.startswith("/media") and not is_mounted(db_path):
+        logger.debug(f"Skipping TN record write to unmounted {db_path}")
+        return
     try:
         with sqlite3.connect(db_path) as conn2:
             cur2 = conn2.cursor()
             cur2.execute(SQL_STATEMENTS['insert_tn'], record_values)
             conn2.commit()
+            # clear DB error flag on success
+            plc = None
+            try:
+                # retrieve PLC instance from caller context if available
+                plc = globals().get('plc')
+                if plc:
+                    plc.write((PLC_TAGS['TN_DB_ERROR'], False))
+            except Exception:
+                pass
             logger.info("Data stored in USB backup database: %s", db_path)
     except Exception as e:
         logger.error("Failed to write TN record to USB backup DB %s: %s", db_path, e)
+        # set DB error flag
+        try:
+            plc = globals().get('plc')
+            if plc:
+                plc.write((PLC_TAGS['TN_DB_ERROR'], True))
+        except Exception:
+            pass
 
 
 def replicate_tn_to_backups(record_values: list) -> None:
@@ -407,14 +463,16 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
 
                         lhconv = res_lh.value
                         rhconv = res_rh.value
-
                         # 0) Rework Mode
                         rework = plc.read(PLC_TAGS['REWORK_MODE'])
                         if rework and rework.value:
-                            # helper: poll a PLC tag until it returns a non-empty string
+                            # helper: poll a PLC tag until it returns a non-empty string or exit on reset
                             def wait_for_label(tag_key: str) -> str:
                                 tag = PLC_TAGS[tag_key]
                                 while True:
+                                    seq = plc.read(PLC_TAGS['SEQ_STEP'])
+                                    if seq and seq.value == 0:
+                                        return None
                                     r = plc.read(tag)
                                     val = r.value if r else None
                                     if isinstance(val, str) and val.strip():
@@ -423,7 +481,8 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
 
                             # poll the raw Julian date and convert to ISO YYYY-MM-DD
                             raw_julian = wait_for_label('REWORK_LABEL_DATE')
-                            # PLC gives YYDDD (e.g. "25157" → year 2025, day 157)
+                            if raw_julian is None:
+                                continue
                             yy = int(raw_julian[:2])
                             doy = int(raw_julian[2:])
                             label_date = (
@@ -513,7 +572,8 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             set_pass(plc, True)
                             if wait_for_datastore_or_reset(plc):
                                 # Always read the finished serial directly (no unique SN increment)
-                                finished_serial = plc.read(PLC_TAGS['FINISHED_SERIAL']).value
+                                # finished serial is same as TLA1_TN
+                                finished_serial = plc.read(PLC_TAGS['TLA1_TN']).value
 
                                 ts = time.strftime('%Y-%m-%d %H:%M:%S')
                                 # insert into local DB

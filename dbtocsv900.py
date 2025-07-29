@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-dbtocsv900.py
+dbtocsv.py
 
 Exports rows from the `tn` table in the SQLite database to daily CSV files
 both locally and to a USB-mounted directory. If anything goes wrong
 (e.g. DB locked, USB unmounted, permission error), it logs the error,
 waits, retries until it succeeds, and then backs up the DB file.
 
-Daily logs are kept in ~/dbtocsv_logs900/ with date suffix; active log lives at ~/dbtocsv900.log.
+Daily logs are kept in ~/dbtocsv_logs/ with date suffix; active log lives at ~/dbtocsv.log.
 
 Saved files-
     CSV Exports (File name has yesterday's date appended)
-        /home/gap900/csv_exports900/YYYY-MM-DD.csv
-        /media/usbdrive/csv_exports900/YYYY-MM-DD.csv
+        /home/gap900/csv_exports/YYYY-MM-DD.csv
+        /media/usbdrive/csv_exports/YYYY-MM-DD.csv
     DB Backups (Current and dated)
-        /home/gap900/db_backup900/tndb900.db
-        /media/usbdrive/db_backup900/tndb900.db
-        /home/gap900/db_backup900/tndb900_YYYY-MM-DD.db
-        /media/usbdrive/db_backup900/tndb900_YYYY-MM-DD.db
+        /home/gap900/db_backup/tndb900.db
+        /media/usbdrive/db_backup/tndb900.db
+        /home/gap900/db_backup/tndb900_YYYY-MM-DD.db
+        /media/usbdrive/db_backup/tndb900_YYYY-MM-DD.db
 """
 
 import sqlite3
@@ -31,6 +31,10 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 import traceback  # keep for exception logging
 
+# Helper to detect a real mount
+def is_mounted(path: str) -> bool:
+    return os.path.ismount(os.path.dirname(path))
+
 # Configuration
 DB_PATH        = "/home/gap900/tndb900.db"
 CSV_DIR        = "/home/gap900/csv_exports900"
@@ -43,7 +47,7 @@ RETRY_DELAY    = 60   # seconds between retry attempts
 LOG_BACKUP_DIR = Path.home() / "dbtocsv_logs900"
 LOG_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
-# Setup logging: active log at ~/dbtocsv900.log, rotated daily into ~/dbtocsv_logs900
+# Setup logging: active log at ~/dbtocsv.log, rotated daily into ~/dbtocsv_logs
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
 # INFO handler: only file‐save successes
@@ -82,36 +86,44 @@ def export_csv() -> None:
     """
     Export all rows from 'tn' table to daily CSV files in local and USB directories.
     """
-    yesterday = datetime.now() - timedelta(days=1)
-    filename = yesterday.strftime("%Y-%m-%d") + ".csv"
-
     try:
+        yesterday = datetime.now() - timedelta(days=1)
+        filename = yesterday.strftime("%Y-%m-%d") + ".csv"
+
+        # fetch rows
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
-            # export the entire table each day
             cursor.execute(
                 "SELECT id, date, finished_serial, component_serial1, component_serial2, status "
                 "FROM tn"
             )
-
             rows = cursor.fetchall()
         if not rows:
             logger.debug("No entries to export.")
             return
 
-        for target_dir in (CSV_DIR, USB_CSV_DIR, USB2_CSV_DIR):
-            path = Path(target_dir) / filename
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, mode="w", newline="") as f:
-                writer = csv.writer(f, delimiter="\t")
-                writer.writerow([
-                    "id", "date", "finished_serial",
-                    "component_serial1", "component_serial2", "status"
-                ])
-                writer.writerows(rows)
-            logger.info(f"CSV file written to {path}")
+        # write yesterday's CSV locally
+        local_path = Path(CSV_DIR) / filename
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(local_path, mode="w", newline="") as f:
+            writer = csv.writer(f, delimiter="\t")
+            writer.writerow([
+                "id", "date", "finished_serial",
+                "component_serial1", "component_serial2", "status"
+            ])
+            writer.writerows(rows)
+        logger.info(f"CSV file written to {local_path}")
 
-        logger.info(f"Exported {len(rows)} entries to both CSV locations")
+        # backfill any missing CSVs to mounted USB drives
+        for csv_file in Path(CSV_DIR).glob("*.csv"):
+            for target_dir in (USB_CSV_DIR, USB2_CSV_DIR):
+                if not is_mounted(target_dir):
+                    continue
+                dest = Path(target_dir) / csv_file.name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if not dest.exists():
+                    shutil.copy2(str(csv_file), str(dest))
+                    logger.info(f"Backfilled {csv_file.name} to {dest}")
     except Exception:
         logger.exception("export_csv failed")
 
@@ -130,6 +142,10 @@ def backup_db() -> None:
 
     base = os.path.basename(DB_PATH)
     for d in DB_BACKUP_DIRS:
+        # skip unmounted USB backup locations
+        if d.startswith("/media") and not os.path.ismount(d):
+            logger.debug(f"Skipping DB backup to unmounted {d}")
+            continue
         try:
             os.makedirs(d, exist_ok=True)
             backup_path = Path(d) / base

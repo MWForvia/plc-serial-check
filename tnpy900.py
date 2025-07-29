@@ -29,6 +29,11 @@ import subprocess
 from pathlib import Path
 from typing import Any
 from datetime import datetime, timedelta
+ # Helper to detect real mount
+# import os  # duplicate import removed
+
+def is_mounted(path: str) -> bool:
+    return os.path.ismount(os.path.dirname(path))
 
 # --- Logging setup ---
 log_dir = Path.home() / "tnpy_logs900"
@@ -96,6 +101,11 @@ PLC_TAGS = {
     'SCAN_COMPLETE':         'FIX_513D.Seq.Conv_Barcode_Passed',
     'PART_FAIL':             'FIX_513D.Seq.Part_Failed[0]',
     'LEAK_TEST_FAIL':        'FIX_513D.Seq.Leak_Test_Failed',
+    # Label scanning and manual entry tags
+    'LABEL_READ_COMPLETE':   'FIX_513D.Label_Barcode.READ_COMPLETE',
+    'LABEL_BARCODE_EXTRACT': 'FIX_513D.Label_Barcode.EXTRACT[2]',
+    'LABEL_FAULT':           'FIX_513D.Label_Barcode.FAULT_TIMER.DN',
+    'TN_MANUAL_ENTRY':       'TN_Manual_Entry',
 }
 
 SQL_STATEMENTS = {
@@ -209,6 +219,10 @@ def sync_db_from_backup(local_db: str) -> None:
 
     # copy source to the other two
     for target, tgt_path in paths.items():
+        # skip unmounted USB sync targets
+        if tgt_path.startswith("/media") and not is_mounted(tgt_path):
+            logger.debug(f"Skipping DB sync to unmounted {tgt_path}")
+            continue
         if target == source or rows[target] == src_count:
             continue
         try:
@@ -251,6 +265,10 @@ def wait_for_datastore_or_reset(plc: LogixDriver) -> bool:
 
 def wait_for_fail_or_reset(plc: LogixDriver) -> bool:
     while True:
+        # exit on reset
+        rs = plc.read(PLC_TAGS['SEQ_STEP'])
+        if rs and rs.value == 0:
+            return False
         fl = plc.read(PLC_TAGS['PART_FAIL'])
         if fl and fl.value:
             return True
@@ -287,15 +305,33 @@ def set_pass(plc: LogixDriver, passed: bool) -> None:
 
 def insert_tn_record(db_path: str, timestamp: str, finished_serial: Any,
                      lhconv: Any, rhconv: Any, status: str) -> None:
+    # skip writes to unmounted USB paths
+    if db_path.startswith("/media") and not is_mounted(db_path):
+        logger.debug(f"Skipping TN record write to unmounted {db_path}")
+        return
     try:
         with sqlite3.connect(db_path) as conn2:
             cur2 = conn2.cursor()
             cur2.execute(SQL_STATEMENTS['insert_tn'],
                          (timestamp, finished_serial, lhconv, rhconv, status))
             conn2.commit()
+            # clear DB error flag on success
+            try:
+                plc = globals().get('plc')
+                if plc:
+                    plc.write((PLC_TAGS['TN_DB_ERROR'], False))
+            except Exception:
+                pass
             logger.info("Data stored in USB backup database: %s", db_path)
     except Exception as e:
         logger.error("Failed to write TN record to USB backup DB %s: %s", db_path, e)
+        # set DB error flag on failure
+        try:
+            plc = globals().get('plc')
+            if plc:
+                plc.write((PLC_TAGS['TN_DB_ERROR'], True))
+        except Exception:
+            pass
 
 
 def replicate_tn_to_backups(timestamp: str, finished_serial: Any,
@@ -320,7 +356,7 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
                            (ts, 'N/A', lhconv, rhconv, status))
             cursor.connection.commit()
             logger.error("Leak Test Failed - Data stored in database")
-            insert_tn_record(USB_DB_BACKUP, ts, 'N/A', lhconv, rhconv, status)
+            replicate_tn_to_backups(ts, 'N/A', lhconv, rhconv, status)
         return
 
     # 2) Duplicate-SN logic
@@ -359,7 +395,7 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
                        (ts, 'N/A', lhconv, rhconv, status))
         cursor.connection.commit()
         logger.error("Failed TN Check - Data stored in database")
-        insert_tn_record(USB_DB_BACKUP, ts, 'N/A', lhconv, rhconv, status)
+        replicate_tn_to_backups(ts, 'N/A', lhconv, rhconv, status)
 
 
 def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
@@ -380,6 +416,8 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
         try:
             logger.debug("Attempting connection to PLC at %s", plc_ip_address)
             with LogixDriver(plc_ip_address) as plc:
+                # expose plc globally for error flag writes
+                globals()['plc'] = plc
                 threading.Thread(target=heartbeat_loop, args=(plc,), daemon=True).start()
                 logger.info("PLC connection established.")
 
@@ -403,8 +441,8 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                                 'First Piece Check'))
                                 conn.commit()
                                 logger.info("Data stored in local database (First Piece Check)")
-                                insert_tn_record(USB_DB_BACKUP, ts, finished_serial,
-                                                 lhconv, rhconv, 'First Piece Check')
+                                replicate_tn_to_backups(ts, finished_serial,
+                                                     lhconv, rhconv, 'First Piece Check')
                             continue
 
                         # 1) Leak-test rerun logic
@@ -422,112 +460,93 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                                 'Passed - Previously failed leak test.'))
                                 conn.commit()
                                 logger.info("Data stored in local database (Leak Test Rerun)")
-                                insert_tn_record(USB_DB_BACKUP, ts, finished_serial,
-                                                 lhconv, rhconv,
-                                                 'Passed - Previously failed leak test.')
+                                replicate_tn_to_backups(ts, finished_serial,
+                                                     lhconv, rhconv,
+                                                     'Passed - Previously failed leak test.')
                             continue
 
                         # 2) Rework Mode
                         rework = plc.read(PLC_TAGS['REWORK_MODE'])
                         if rework and rework.value:
-                            # helper: poll a PLC tag until it returns a non-empty string
-                            def wait_for_label(tag_key: str) -> str:
-                                tag = PLC_TAGS[tag_key]
-                                while True:
-                                    r = plc.read(tag)
-                                    val = r.value if r else None
-                                    if isinstance(val, str) and val.strip():
-                                        return val
-                                    time.sleep(POLL_INTERVAL)
-
-                            # poll the raw Julian date and convert to ISO YYYY-MM-DD
-                            raw_julian = wait_for_label('REWORK_LABEL_DATE')
-                            # PLC gives YYDDD (e.g. "25157" → year 2025, day 157)
-                            yy = int(raw_julian[:2])
-                            doy = int(raw_julian[2:])
-                            label_date = (
-                                datetime(2000 + yy, 1, 1)
-                                + timedelta(days=doy - 1)
-                            ).strftime('%Y-%m-%d')
-
-                            # now poll the rest of the label fields
-                            label_fs   = wait_for_label('REWORK_LABEL_FINISHED')
-                            label_lh   = wait_for_label('REWORK_LABEL_LH')
-                            label_rh   = wait_for_label('REWORK_LABEL_RH')
-
-                            # look for an exact match on the date portion of our timestamp
-                            cursor.execute(
-                                "SELECT id FROM tn "
-                                "WHERE substr(date,1,10) = ? "
-                                "  AND finished_serial = ? "
-                                "  AND component_serial1 = ? "
-                                "  AND component_serial2 = ?",
-                                (label_date, label_fs, label_lh, label_rh)
-                            )
-                            row = cursor.fetchone()
-
-                            valid = False
-                            if row:
-                                row_id = row[0]
-                                # ensure none of those SNs appear in any other row
-                                cursor.execute(
-                                    "SELECT COUNT(*) FROM tn WHERE finished_serial = ? AND id != ?",
-                                    (label_fs, row_id)
-                                )
-                                fs_dup = cursor.fetchone()[0]
-                                cursor.execute(
-                                    "SELECT COUNT(*) FROM tn WHERE component_serial1 = ? AND id != ?",
-                                    (label_lh, row_id)
-                                )
-                                lh_dup = cursor.fetchone()[0]
-                                cursor.execute(
-                                    "SELECT COUNT(*) FROM tn WHERE component_serial2 = ? AND id != ?",
-                                    (label_rh, row_id)
-                                )
-                                rh_dup = cursor.fetchone()[0]
-
-                                if fs_dup == 0 and lh_dup == 0 and rh_dup == 0:
-                                    # new: also verify the scanned LH_CONV/RH_CONV match the label & DB
-                                    if lhconv == label_lh and rhconv == label_rh:
-                                        valid = True
-                                    else:
-                                        logger.error(
-                                            "Rework Fail: scanned converter SNs do not match label data "
-                                            "(scanned LH=%s vs label %s, scanned RH=%s vs label %s)",
-                                            lhconv, label_lh, rhconv, label_rh
-                                        )
-
-                            if valid:
-                                logger.info("Rework Pass: matched row %s", row_id)
-                                set_pass(plc, True)
-                                if wait_for_datastore_or_reset(plc):
-                                    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                                    cursor.execute(
-                                        SQL_STATEMENTS['insert_tn'],
-                                        (ts, label_fs, label_lh, label_rh, 'Rework Pass')
-                                    )
-                                    conn.commit()
-                                    logger.info("Data stored in local DB (Rework Pass)")
-                                    insert_tn_record(
-                                        USB_DB_BACKUP, ts, label_fs, label_lh, label_rh, 'Rework Pass'
-                                    )
+                            # choose manual or label path
+                            # wait for either label read complete, fault timer, or reset
+                            while True:
+                                # exit on reset
+                                seq = plc.read(PLC_TAGS['SEQ_STEP'])
+                                if seq and seq.value == 0:
+                                    label_mode = None
+                                    break
+                                if plc.read(PLC_TAGS['LABEL_READ_COMPLETE']).value:
+                                    label_mode = 'auto'
+                                    break
+                                if plc.read(PLC_TAGS['LABEL_FAULT']).value:
+                                    label_mode = 'manual'
+                                    break
+                                time.sleep(POLL_INTERVAL)
+                            # common vars
+                            ts = time.strftime('%Y-%m-%d %H:%M:%S')
+                            if label_mode == 'auto':
+                                # read extracted finished SN
+                                label_fs = plc.read(PLC_TAGS['LABEL_BARCODE_EXTRACT']).value
+                            elif label_mode == 'manual':
+                                # manual HMI entry
+                                label_fs = plc.read(PLC_TAGS['TN_MANUAL_ENTRY']).value
                             else:
-                                logger.error(
-                                    "Rework Fail: label data date=%s, fs=%s, lh=%s, rh=%s",
-                                    label_date, label_fs, label_lh, label_rh
+                                # aborted by reset
+                                continue
+                            # validate inputs
+                            if not label_fs or not lhconv or not rhconv:
+                                plc.write((PLC_TAGS['TN_DB_ERROR'], True))
+                                set_pass(plc, False)
+                                logger.error("Rework inputs invalid: FS=%s, LH=%s, RH=%s", label_fs, lhconv, rhconv)
+                                if wait_for_fail_or_reset(plc):
+                                    cursor.execute(SQL_STATEMENTS['insert_tn'], (ts, label_fs or 'N/A', lhconv or 'N/A', rhconv or 'N/A', 'Rework Rerun Fail'))
+                                    conn.commit(); replicate_tn_to_backups(ts, label_fs or 'N/A', lhconv or 'N/A', rhconv or 'N/A', 'Rework Rerun Fail')
+                                continue
+                            # DB lookup
+                            try:
+                                cursor.execute(
+                                    "SELECT id FROM tn WHERE finished_serial=? AND component_serial1=? AND component_serial2=?",
+                                    (label_fs, lhconv, rhconv)
                                 )
+                                rows = cursor.fetchall()
+                                cursor.execute(
+                                    "SELECT COUNT(*) FROM tn WHERE finished_serial=? OR component_serial1=? OR component_serial2=?",
+                                    (label_fs, lhconv, rhconv)
+                                )
+                                total = cursor.fetchone()[0]
+                                valid = (len(rows) == 1 and total == 1)
+                            except Exception as e:
+                                plc.write((PLC_TAGS['TN_DB_ERROR'], True))
+                                logger.exception("Rework DB lookup error")
                                 set_pass(plc, False)
                                 if wait_for_fail_or_reset(plc):
-                                    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                                    cursor.execute(SQL_STATEMENTS['insert_tn'], (ts, label_fs, lhconv, rhconv, 'Rework Rerun Fail'))
+                                    conn.commit(); replicate_tn_to_backups(ts, label_fs, lhconv, rhconv, 'Rework Rerun Fail')
+                                continue
+
+                            # finalize pass/fail
+                            if valid:
+                                row_id = rows[0][0]
+                                logger.info("Rework Rerun Pass: matched record %s", row_id)
+                                set_pass(plc, True)
+                                if wait_for_datastore_or_reset(plc):
                                     cursor.execute(
                                         SQL_STATEMENTS['insert_tn'],
-                                        (ts, 'N/A', label_lh, label_rh, 'Rework Fail')
+                                        (ts, label_fs, lhconv, rhconv, 'Rework Rerun')
                                     )
                                     conn.commit()
-                                    logger.error("Data stored in local DB (Rework Fail)")
-                                    insert_tn_record(
-                                        USB_DB_BACKUP, ts, 'N/A', label_lh, label_rh, 'Rework Fail'
+                                    replicate_tn_to_backups(ts, label_fs, lhconv, rhconv, 'Rework Rerun')
+                            else:
+                                logger.error("Rework Rerun Fail: no single matching record for FS=%s, LH=%s, RH=%s", label_fs, lhconv, rhconv)
+                                set_pass(plc, False)
+                                if wait_for_fail_or_reset(plc):
+                                    cursor.execute(
+                                        SQL_STATEMENTS['insert_tn'],
+                                        (ts, label_fs or 'N/A', lhconv, rhconv, 'Rework Rerun Fail')
                                     )
+                                    conn.commit()
+                                    replicate_tn_to_backups(ts, label_fs or 'N/A', lhconv, rhconv, 'Rework Rerun Fail')
                             continue
 
                         # 3) Normal pass / fail
@@ -582,8 +601,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                 logger.info("Data stored in local database (Passed)")
 
                                 # replicate to USB
-                                insert_tn_record(
-                                    USB_DB_BACKUP,
+                                replicate_tn_to_backups(
                                     ts, finished_serial, lhconv, rhconv, 'Passed'
                                 )
 

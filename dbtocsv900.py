@@ -30,6 +30,7 @@ from pathlib import Path
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import traceback  # keep for exception logging
+import sys
 
 # Helper to detect a real mount
 def is_mounted(path: str) -> bool:
@@ -80,6 +81,38 @@ logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 logger.addHandler(info_handler)
 logger.addHandler(debug_handler)
+
+
+# Ensure database and 'tn' table exist
+def ensure_db_schema(db_path: str) -> None:
+    """
+    Create the database file and the 'tn' table if they do not exist.
+    """
+    parent = os.path.dirname(db_path) or '.'
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except Exception as e:
+        logger.error("Failed to create directory for DB %s: %s", parent, e)
+        sys.exit(1)
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tn (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT,
+                    finished_serial TEXT,
+                    component_serial1 TEXT,
+                    component_serial2 TEXT,
+                    status TEXT
+                )
+                """
+            )
+            conn.commit()
+            logger.debug("Ensured schema for database %s", db_path)
+    except Exception as e:
+        logger.error("Failed to create database schema on %s: %s", db_path, e)
+        sys.exit(1)
 
 
 def export_csv() -> None:
@@ -192,6 +225,11 @@ def backup_db() -> None:
 
 
 def main() -> None:
+    # create DB file and schema if missing, and ensure CSV/backup dirs exist
+    ensure_db_schema(DB_PATH)
+    os.makedirs(CSV_DIR, exist_ok=True)
+    for d in DB_BACKUP_DIRS:
+        os.makedirs(d, exist_ok=True)
     while True:
         try:
             export_csv()

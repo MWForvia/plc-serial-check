@@ -31,19 +31,11 @@ from typing import Any
 from datetime import datetime, timedelta
 
 # --- Logging setup ---
-<<<<<<< HEAD
 log_dir = Path.home() / "tnpy_logs900"
 log_dir.mkdir(parents=True, exist_ok=True)
 
 # INFO handler
 info_log = Path.home() / "tnpy900.log"
-=======
-log_dir = Path.home() / "tnpy_logs"
-log_dir.mkdir(parents=True, exist_ok=True)
-
-# INFO handler
-info_log = Path.home() / "tnpy.log"
->>>>>>> 2a97c6a92f957dadeef29b5218c8e55dfb8f556e
 info_handler = TimedRotatingFileHandler(
     filename=str(info_log), when="midnight", interval=1, backupCount=0
 )
@@ -53,11 +45,7 @@ info_handler.setLevel(logging.INFO)
 info_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 
 # DEBUG handler
-<<<<<<< HEAD
 debug_log = Path.home() / "tnpy_debug900.log"
-=======
-debug_log = Path.home() / "tnpy_debug.log"
->>>>>>> 2a97c6a92f957dadeef29b5218c8e55dfb8f556e
 debug_handler = TimedRotatingFileHandler(
     filename=str(debug_log), when="midnight", interval=1, backupCount=0
 )
@@ -80,28 +68,16 @@ except ImportError as e:
 
 # --- Constants ---
 default_local_db   = "/home/gap900/tndb900.db"
-<<<<<<< HEAD
 USB_DB_BACKUP      = "/media/usbdrive/db_backup900/tndb900.db"
 USB_DB_BACKUP2     = "/media/usbdrive2/db_backup900/tndb900.db"
-=======
-USB_DB_BACKUP      = "/media/usbdrive/db_backup/tndb900.db"
-USB_DB_BACKUP2     = "/media/usbdrive2/db_backup/tndb900.db"
->>>>>>> 2a97c6a92f957dadeef29b5218c8e55dfb8f556e
 USB_DB_BACKUPS     = [USB_DB_BACKUP, USB_DB_BACKUP2]
 
 PLC_TAGS = {
+    # Created tags (for this project)
     'PI_HEARTBEAT':          'PI_Heartbeat',
-    'LH_CONV':               'FIX_513D.Conv_Barcode.EXTRACT[2]',
-    'RH_CONV':               'FIX_513D.Conv_Barcode_R.EXTRACT[2]',
-    'DATASTORE':             'FIX_513D.Seq.Data_Store',
-    'SEQ_STEP':              'SEQUENCE_STEP',
-    'FINISHED_SERIAL':       'ZEBRA.Working_String[20]',
-    'SCAN_COMPLETE':         'FIX_513D.Seq.Conv_Barcode_Passed',
     'TN_CHECK_PASS':         'TN_Check_Pass',
     'TN_CHECK_FAIL':         'TN_Check_Fail',
     'TN_DB_ERROR':           'TN_DB_Error',
-    'PART_FAIL':             'FIX_513D.Seq.Part_Failed[0]',
-    'LEAK_TEST_FAIL':        'FIX_513D.Seq.Leak_Test_Failed',
     'FIRST_PIECE_CHECK':     'FIRST_PIECE_CHECK',
     'REWORK_MODE':           'REWORK_MODE',
     'REWORK_LABEL_DATE':     'REWORK_LABEL_DATE',
@@ -110,7 +86,16 @@ PLC_TAGS = {
     'REWORK_LABEL_RH':       'REWORK_LABEL_RH',
     'TLA_SN_PASS':           'TLA_SN_PASS',
     'TN_TLA_SN_CHECK_PASS':  'TN_TLA_SN_CHECK_PASS',
-    'SERIAL_HOLDER':         'ZEBRA.Working_String[20]',
+    # Existing tags (from the PLC)
+    'SERIAL_HOLDER':         'ZEBRA.Working_String[20]',    
+    'LH_CONV':               'FIX_513D.Conv_Barcode.EXTRACT[2]',
+    'RH_CONV':               'FIX_513D.Conv_Barcode_R.EXTRACT[2]',
+    'DATASTORE':             'FIX_513D.Seq.Data_Store',
+    'SEQ_STEP':              'SEQUENCE_STEP',
+    'FINISHED_SERIAL':       'ZEBRA.Working_String[20]',
+    'SCAN_COMPLETE':         'FIX_513D.Seq.Conv_Barcode_Passed',
+    'PART_FAIL':             'FIX_513D.Seq.Part_Failed[0]',
+    'LEAK_TEST_FAIL':        'FIX_513D.Seq.Leak_Test_Failed',
 }
 
 SQL_STATEMENTS = {

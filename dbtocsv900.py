@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-dbtocsv.py
+dbtocsv900.py
 
 Exports rows from the `tn` table in the SQLite database to daily CSV files
 both locally and to a USB-mounted directory. If anything goes wrong
 (e.g. DB locked, USB unmounted, permission error), it logs the error,
 waits, retries until it succeeds, and then backs up the DB file.
 
-Daily logs are kept in ~/dbtocsv_logs/ with date suffix; active log lives at ~/dbtocsv.log.
+Daily logs are kept in ~/dbtocsv_logs900/ with date suffix; active log lives at ~/dbtocsv900.log.
 
 Saved files-
     CSV Exports (File name has yesterday's date appended)
-        /home/gap900/csv_exports/YYYY-MM-DD.csv
-        /media/usbdrive/csv_exports/YYYY-MM-DD.csv
+        /home/gap900/csv_exports900/YYYY-MM-DD.csv
+        /media/usbdrive/csv_exports900/YYYY-MM-DD.csv
     DB Backups (Current and dated)
-        /home/gap900/db_backup/tndb900.db
-        /media/usbdrive/db_backup/tndb900.db
-        /home/gap900/db_backup/tndb900_YYYY-MM-DD.db
-        /media/usbdrive/db_backup/tndb900_YYYY-MM-DD.db
+        /home/gap900/db_backup900/tndb900.db
+        /media/usbdrive/db_backup900/tndb900.db
+        /home/gap900/db_backup900/tndb900_YYYY-MM-DD.db
+        /media/usbdrive/db_backup900/tndb900_YYYY-MM-DD.db
 """
 
 import sqlite3
@@ -33,7 +33,6 @@ import traceback  # keep for exception logging
 
 # Configuration
 DB_PATH        = "/home/gap900/tndb900.db"
-<<<<<<< HEAD
 CSV_DIR        = "/home/gap900/csv_exports900"
 USB_CSV_DIR    = "/media/usbdrive/csv_exports900"
 USB2_CSV_DIR   = "/media/usbdrive2/csv_exports900"
@@ -42,27 +41,13 @@ RETRY_DELAY    = 60   # seconds between retry attempts
 
 # directory where rotated logs live
 LOG_BACKUP_DIR = Path.home() / "dbtocsv_logs900"
-=======
-CSV_DIR        = "/home/gap900/csv_exports"
-USB_CSV_DIR    = "/media/usbdrive/csv_exports"
-USB2_CSV_DIR  = "/media/usbdrive2/csv_exports"
-DB_BACKUP_DIRS = ["/media/usbdrive/db_backup", "/media/usbdrive2/db_backup", "/home/gap900/db_backup"]
-RETRY_DELAY    = 60   # seconds between retry attempts
-
-# directory where rotated logs live
-LOG_BACKUP_DIR = Path.home() / "dbtocsv_logs"
->>>>>>> 2a97c6a92f957dadeef29b5218c8e55dfb8f556e
 LOG_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
-# Setup logging: active log at ~/dbtocsv.log, rotated daily into ~/dbtocsv_logs
+# Setup logging: active log at ~/dbtocsv900.log, rotated daily into ~/dbtocsv_logs900
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
 # INFO handler: only file‐save successes
-<<<<<<< HEAD
 info_log     = Path.home() / "dbtocsv900.log"
-=======
-info_log     = Path.home() / "dbtocsv.log"
->>>>>>> 2a97c6a92f957dadeef29b5218c8e55dfb8f556e
 info_handler = TimedRotatingFileHandler(
     filename=str(info_log),
     when="midnight",
@@ -75,11 +60,7 @@ info_handler.setLevel  (logging.INFO)
 info_handler.setFormatter(formatter)
 
 # DEBUG handler: all other statuses, retries, errors
-<<<<<<< HEAD
 debug_log     = Path.home() / "dbtocsv_debug900.log"
-=======
-debug_log     = Path.home() / "dbtocsv_debug.log"
->>>>>>> 2a97c6a92f957dadeef29b5218c8e55dfb8f556e
 debug_handler = TimedRotatingFileHandler(
     filename=str(debug_log),
     when="midnight",

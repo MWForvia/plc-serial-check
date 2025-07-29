@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-dbtocsv.py
+dbtocsv300.py
 
 Exports rows from the `tn` table in the SQLite database to daily CSV files
 both locally and to a USB-mounted directory. If anything goes wrong
 (e.g. DB locked, USB unmounted, permission error), it logs the error,
 waits, retries until it succeeds, and then backs up the DB file.
 
-Daily logs are kept in ~/dbtocsv_logs/ with date suffix; active log lives at ~/dbtocsv.log.
+Daily logs are kept in ~/dbtocsv_logs300/ with date suffix; active log lives at ~/dbtocsv300.log.
 
 Saved files-
     CSV Exports (File name has yesterday's date appended)
-        /home/gap900/csv_exports/YYYY-MM-DD.csv
-        /media/usbdrive/csv_exports/YYYY-MM-DD.csv
+        /home/gap300/csv_exports300/YYYY-MM-DD.csv
+        /media/usbdrive/csv_exports300/YYYY-MM-DD.csv
     DB Backups (Current and dated)
-        /home/gap900/db_backup/tndb900.db
-        /media/usbdrive/db_backup/tndb900.db
-        /home/gap900/db_backup/tndb900_YYYY-MM-DD.db
-        /media/usbdrive/db_backup/tndb900_YYYY-MM-DD.db
+        /home/gap300/db_backup300/tndb300.db
+        /media/usbdrive/db_backup300/tndb300.db
+        /home/gap300/db_backup300/tndb300_YYYY-MM-DD.db
+        /media/usbdrive/db_backup300/tndb300_YYYY-MM-DD.db
 """
 
 import sqlite3
@@ -32,37 +32,22 @@ from logging.handlers import TimedRotatingFileHandler
 import traceback  # keep for exception logging
 
 # Configuration
-DB_PATH        = "/home/gap900/tndb900.db"
-<<<<<<< HEAD
-CSV_DIR        = "/home/gap900/csv_exports900"
-USB_CSV_DIR    = "/media/usbdrive/csv_exports900"
-USB2_CSV_DIR   = "/media/usbdrive2/csv_exports900"
-DB_BACKUP_DIRS = ["/media/usbdrive/db_backup900", "/media/usbdrive2/db_backup900", "/home/gap900/db_backup900"]
+DB_PATH        = "/home/gap300/tndb300.db"
+CSV_DIR        = "/home/gap300/csv_exports300"
+USB_CSV_DIR    = "/media/usbdrive/csv_exports300"
+USB2_CSV_DIR   = "/media/usbdrive2/csv_exports300"
+DB_BACKUP_DIRS = ["/media/usbdrive/db_backup300", "/media/usbdrive2/db_backup300", "/home/gap300/db_backup300"]
 RETRY_DELAY    = 60   # seconds between retry attempts
 
 # directory where rotated logs live
-LOG_BACKUP_DIR = Path.home() / "dbtocsv_logs900"
-=======
-CSV_DIR        = "/home/gap900/csv_exports"
-USB_CSV_DIR    = "/media/usbdrive/csv_exports"
-USB2_CSV_DIR  = "/media/usbdrive2/csv_exports"
-DB_BACKUP_DIRS = ["/media/usbdrive/db_backup", "/media/usbdrive2/db_backup", "/home/gap900/db_backup"]
-RETRY_DELAY    = 60   # seconds between retry attempts
-
-# directory where rotated logs live
-LOG_BACKUP_DIR = Path.home() / "dbtocsv_logs"
->>>>>>> 2a97c6a92f957dadeef29b5218c8e55dfb8f556e
+LOG_BACKUP_DIR = Path.home() / "dbtocsv_logs300"
 LOG_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
-# Setup logging: active log at ~/dbtocsv.log, rotated daily into ~/dbtocsv_logs
+# Setup logging: active log at ~/dbtocsv300.log, rotated daily into ~/dbtocsv_logs300
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
 # INFO handler: only file‐save successes
-<<<<<<< HEAD
-info_log     = Path.home() / "dbtocsv900.log"
-=======
-info_log     = Path.home() / "dbtocsv.log"
->>>>>>> 2a97c6a92f957dadeef29b5218c8e55dfb8f556e
+info_log     = Path.home() / "dbtocsv300.log"
 info_handler = TimedRotatingFileHandler(
     filename=str(info_log),
     when="midnight",
@@ -75,11 +60,7 @@ info_handler.setLevel  (logging.INFO)
 info_handler.setFormatter(formatter)
 
 # DEBUG handler: all other statuses, retries, errors
-<<<<<<< HEAD
-debug_log     = Path.home() / "dbtocsv_debug900.log"
-=======
-debug_log     = Path.home() / "dbtocsv_debug.log"
->>>>>>> 2a97c6a92f957dadeef29b5218c8e55dfb8f556e
+debug_log     = Path.home() / "dbtocsv_debug300.log"
 debug_handler = TimedRotatingFileHandler(
     filename=str(debug_log),
     when="midnight",
@@ -107,9 +88,12 @@ def export_csv() -> None:
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
-            # export the entire table each day
+            # export the entire table each day using new 17-column schema
             cursor.execute(
-                "SELECT id, date, finished_serial, component_serial1, component_serial2, status "
+                "SELECT id, date, tla1_pn, tla1_tn, tla1_vpps, tla1_duns, "
+                "conv1_pn, conv1_tn, conv1_vpps, conv1_duns, "
+                "tla2_pn, tla2_tn, tla2_vpps, tla2_duns, "
+                "conv2_pn, conv2_tn, conv2_vpps, conv2_duns "
                 "FROM tn"
             )
 
@@ -123,9 +107,13 @@ def export_csv() -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, mode="w", newline="") as f:
                 writer = csv.writer(f, delimiter="\t")
+                # write header for 17 columns
                 writer.writerow([
-                    "id", "date", "finished_serial",
-                    "component_serial1", "component_serial2", "status"
+                    "id", "date",
+                    "tla1_pn", "tla1_tn", "tla1_vpps", "tla1_duns",
+                    "conv1_pn", "conv1_tn", "conv1_vpps", "conv1_duns",
+                    "tla2_pn", "tla2_tn", "tla2_vpps", "tla2_duns",
+                    "conv2_pn", "conv2_tn", "conv2_vpps", "conv2_duns"
                 ])
                 writer.writerows(rows)
             logger.info(f"CSV file written to {path}")
@@ -166,9 +154,12 @@ def backup_db() -> None:
                 bcursor.execute(
                     "CREATE TABLE IF NOT EXISTS tn ("
                     "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                    "date TEXT, finished_serial TEXT, "
-                    "component_serial1 TEXT, component_serial2 TEXT, "
-                    "status TEXT)"
+                    "date TEXT, "
+                    "tla1_pn TEXT, tla1_tn TEXT, tla1_vpps TEXT, tla1_duns TEXT, "
+                    "conv1_pn TEXT, conv1_tn TEXT, conv1_vpps TEXT, conv1_duns TEXT, "
+                    "tla2_pn TEXT, tla2_tn TEXT, tla2_vpps TEXT, tla2_duns TEXT, "
+                    "conv2_pn TEXT, conv2_tn TEXT, conv2_vpps TEXT, conv2_duns TEXT"
+                    ")"
                 )
                 # Find max ID in backup
                 bcursor.execute("SELECT MAX(id) FROM tn")
@@ -182,8 +173,14 @@ def backup_db() -> None:
                 new_count = cur.fetchone()[0]
                 if new_count > 0:
                     bconn.execute(
-                        "INSERT INTO tn(date, finished_serial, component_serial1, component_serial2, status) "
-                        "SELECT date, finished_serial, component_serial1, component_serial2, status "
+                        "INSERT INTO tn(date, tla1_pn, tla1_tn, tla1_vpps, tla1_duns, "
+                        "conv1_pn, conv1_tn, conv1_vpps, conv1_duns, "
+                        "tla2_pn, tla2_tn, tla2_vpps, tla2_duns, "
+                        "conv2_pn, conv2_tn, conv2_vpps, conv2_duns) "
+                        "SELECT date, tla1_pn, tla1_tn, tla1_vpps, tla1_duns, "
+                        "conv1_pn, conv1_tn, conv1_vpps, conv1_duns, "
+                        "tla2_pn, tla2_tn, tla2_vpps, tla2_duns, "
+                        "conv2_pn, conv2_tn, conv2_vpps, conv2_duns "
                         "FROM src.tn WHERE id > ?", (max_id,)
                     )
                 bconn.execute("DETACH DATABASE src")

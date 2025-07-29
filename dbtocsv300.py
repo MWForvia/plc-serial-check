@@ -30,6 +30,10 @@ from pathlib import Path
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import traceback  # keep for exception logging
+ 
+# Helper to detect real mount
+def is_mounted(path: str) -> bool:
+    return os.path.ismount(os.path.dirname(path))
 
 # Configuration
 DB_PATH        = "/home/gap300/tndb300.db"
@@ -37,6 +41,7 @@ CSV_DIR        = "/home/gap300/csv_exports300"
 USB_CSV_DIR    = "/media/usbdrive/csv_exports300"
 USB2_CSV_DIR   = "/media/usbdrive2/csv_exports300"
 DB_BACKUP_DIRS = ["/media/usbdrive/db_backup300", "/media/usbdrive2/db_backup300", "/home/gap300/db_backup300"]
+BACKFILL_DAYS  = 7   # how many past days of CSVs to backfill
 RETRY_DELAY    = 60   # seconds between retry attempts
 
 # directory where rotated logs live
@@ -82,8 +87,58 @@ def export_csv() -> None:
     """
     Export all rows from 'tn' table to daily CSV files in local and USB directories.
     """
+    # Generate yesterday's CSV locally
     yesterday = datetime.now() - timedelta(days=1)
     filename = yesterday.strftime("%Y-%m-%d") + ".csv"
+    # Read all rows
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, date, tla1_pn, tla1_tn, tla1_vpps, tla1_duns, "
+                "conv1_pn, conv1_tn, conv1_vpps, conv1_duns, "
+                "tla2_pn, tla2_tn, tla2_vpps, tla2_duns, "
+                "conv2_pn, conv2_tn, conv2_vpps, conv2_duns "
+                "FROM tn"
+            )
+            rows = cursor.fetchall()
+    except Exception:
+        logger.exception("export_csv DB read failed")
+        return
+    if not rows:
+        logger.debug("No entries to export.")
+        return
+    # Write local file
+    local_path = Path(CSV_DIR) / filename
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(local_path, mode="w", newline="") as f:
+            writer = csv.writer(f, delimiter="\t")
+            writer.writerow([
+                "id", "date",
+                "tla1_pn", "tla1_tn", "tla1_vpps", "tla1_duns",
+                "conv1_pn", "conv1_tn", "conv1_vpps", "conv1_duns",
+                "tla2_pn", "tla2_tn", "tla2_vpps", "tla2_duns",
+                "conv2_pn", "conv2_tn", "conv2_vpps", "conv2_duns"
+            ])
+            writer.writerows(rows)
+        logger.info(f"CSV file written to {local_path}")
+    except Exception:
+        logger.exception(f"Failed to write CSV to {local_path}")
+    # Helper: detect real mount
+    def is_mounted(path: str) -> bool:
+        return os.path.ismount(os.path.dirname(path))
+    # Backfill all local CSVs to mounted USBs
+    for csv_file in Path(CSV_DIR).glob("*.csv"):
+        for target_dir in (USB_CSV_DIR, USB2_CSV_DIR):
+            if not is_mounted(target_dir):
+                continue
+            dest = Path(target_dir) / csv_file.name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if not dest.exists():
+                shutil.copy2(str(csv_file), str(dest))
+                logger.info(f"Backfilled {csv_file.name} to {dest}")
+    logger.info(f"Exported {len(rows)} entries to all mounted CSV locations")
 
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -103,6 +158,10 @@ def export_csv() -> None:
             return
 
         for target_dir in (CSV_DIR, USB_CSV_DIR, USB2_CSV_DIR):
+            # skip unmounted USB directories
+            if target_dir.startswith("/media") and not is_mounted(target_dir):
+                logger.debug(f"Skipping CSV export to unmounted {target_dir}")
+                continue
             path = Path(target_dir) / filename
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, mode="w", newline="") as f:
@@ -138,6 +197,10 @@ def backup_db() -> None:
     base = os.path.basename(DB_PATH)
     for d in DB_BACKUP_DIRS:
         try:
+            # skip unmounted usb dirs
+            if d.startswith("/media") and not os.path.ismount(d):
+                logger.debug(f"Skipping DB backup to unmounted {d}")
+                continue
             os.makedirs(d, exist_ok=True)
             backup_path = Path(d) / base
 

@@ -115,6 +115,37 @@ SQL_STATEMENTS = {
     )
 }
 
+# Ensure local DB file exists and has the required schema
+def ensure_db_schema(db_path: str) -> None:
+    """
+    Create the database file and the 'tn' table if they do not exist.
+    """
+    parent = os.path.dirname(db_path) or '.'
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except Exception as e:
+        logger.error("Failed to create directory for DB %s: %s", parent, e)
+        sys.exit(1)
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tn (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT,
+                    finished_serial TEXT,
+                    component_serial1 TEXT,
+                    component_serial2 TEXT,
+                    status TEXT
+                )
+                """
+            )
+            conn.commit()
+            logger.debug("Ensured schema for database %s", db_path)
+    except Exception as e:
+        logger.error("Failed to create database schema on %s: %s", db_path, e)
+        sys.exit(1)
+
 POLL_INTERVAL      = 0.5   # general polling interval
 FAST_POLL_INTERVAL = 0.1   # fast polling for fail/datastore
 RETRY_DELAY        = 10    # seconds between retries
@@ -305,10 +336,18 @@ def set_pass(plc: LogixDriver, passed: bool) -> None:
 
 def insert_tn_record(db_path: str, timestamp: str, finished_serial: Any,
                      lhconv: Any, rhconv: Any, status: str) -> None:
-    # skip writes to unmounted USB paths
-    if db_path.startswith("/media") and not is_mounted(db_path):
-        logger.debug(f"Skipping TN record write to unmounted {db_path}")
-        return
+    # skip writes to unmounted USB paths; if mounted, ensure directory exists
+    if db_path.startswith("/media"):
+        if not is_mounted(db_path):
+            logger.debug(f"Skipping TN record write to unmounted {db_path}")
+            return
+        # create parent directory if missing
+        parent_dir = os.path.dirname(db_path)
+        try:
+            os.makedirs(parent_dir, exist_ok=True)
+        except Exception as e:
+            logger.error("Failed to create directory %s for USB backup DB %s: %s", parent_dir, db_path, e)
+            return
     try:
         with sqlite3.connect(db_path) as conn2:
             cur2 = conn2.cursor()
@@ -640,6 +679,8 @@ def main() -> None:
     args = parser.parse_args()
 
     db_file = os.path.expanduser(args.db)
+    # ensure the local database file and 'tn' table exist
+    ensure_db_schema(db_file)
     logger.info("Starting tnpy: PLC=%s, DB=%s", args.plc, db_file)
     sync_db_from_backup(db_file)
     monitor_and_update(args.plc, db_file)

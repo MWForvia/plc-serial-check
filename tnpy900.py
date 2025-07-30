@@ -197,7 +197,9 @@ def check_db_integrity(db_path: str) -> bool:
 
 # --- USB DB repair at startup and on mount events ---
 def repair_usb_dbs(local_db: str) -> None:
+    logger.debug("Debug: entering repair_usb_dbs with local_db=%s", local_db)
     """Check integrity and existence of DBs on USB drives and repair from richest source."""
+    start = time.time()
     try:
         db_paths = [local_db]
         # scan /media for mounted USB directories
@@ -234,6 +236,8 @@ def repair_usb_dbs(local_db: str) -> None:
                 logger.exception("Failed to repair database %s", p)
     except Exception:
         logger.exception("Unexpected error in repair_usb_dbs")
+    finally:
+        logger.debug("Debug: exiting repair_usb_dbs (duration=%.1f s)", time.time() - start)
 
 def usb_monitor(local_db: str) -> None:
     """Background thread to monitor new USB mounts and repair DBs when plugged in."""
@@ -265,6 +269,8 @@ def sync_db_from_backup(local_db: str) -> None:
     Tri‐directional sync: pick the DB (local, USB1 or USB2) with the most rows
     and copy it over the other two, so the richest DB is the source‐of‐truth.
     """
+    logger.debug("Debug: entering sync_db_from_backup with local_db=%s", local_db)
+    sync_start = time.time()
     # --- Health check USB2 only; if corrupted, reformat & clone from local or USB1 ---
     usb2 = USB_DB_BACKUP2
     if os.path.exists(usb2) and not check_db_integrity(usb2):
@@ -279,9 +285,15 @@ def sync_db_from_backup(local_db: str) -> None:
             logger.warning("Repairing corrupted USB2 DB at %s from %s", usb2, healthy)
             mount_pt = os.path.dirname(usb2)
             reformat_usb(mount_pt)
-            os.makedirs(mount_pt, exist_ok=True)
-            shutil.copy2(healthy, usb2)
-            logger.info("Cloned %s → %s", healthy, usb2)
+            try:
+                os.makedirs(mount_pt, exist_ok=True)
+            except Exception as e:
+                logger.error("Failed to create mount directory %s: %s", mount_pt, e)
+            try:
+                shutil.copy2(healthy, usb2)
+                logger.info("Cloned %s → %s", healthy, usb2)
+            except Exception:
+                logger.exception("Failed to clone DB from %s to %s", healthy, usb2)
         else:
             logger.critical(
                 "No healthy source to repair corrupted USB2 DB at %s", usb2
@@ -332,6 +344,7 @@ def sync_db_from_backup(local_db: str) -> None:
             )
         except Exception:
             logger.exception("Failed to copy DB from %s to %s", src_path, tgt_path)
+    logger.debug("Debug: exiting sync_db_from_backup (duration=%.1f s)", time.time() - sync_start)
 
 
 def wait_for_tag(plc: LogixDriver, tag_key: str) -> None:
@@ -758,7 +771,10 @@ def main() -> None:
         backup_dir = os.path.dirname(dbp)
         mount_point = os.path.dirname(backup_dir)
         if os.path.ismount(mount_point):
-            os.makedirs(backup_dir, exist_ok=True)
+            try:
+                os.makedirs(backup_dir, exist_ok=True)
+            except Exception as e:
+                logger.error("Failed to create USB backup directory %s: %s", backup_dir, e)
         else:
             logger.debug(f"Mount point {mount_point} not mounted; skipping directory creation for {dbp}")
     # start USB mount monitor

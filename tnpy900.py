@@ -19,17 +19,18 @@ Schema:
 import argparse
 import logging
 import sys
+import os  # needed for path checks and directory creation
 from logging.handlers import TimedRotatingFileHandler
 import threading
 import sqlite3
 import time
-import os
-import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 from datetime import datetime, timedelta
- # Helper to detect real mount
+import shutil
+import subprocess
+
+# Helper to detect real mount
 # import os  # duplicate import removed
 
 def is_mounted(path: str) -> bool:
@@ -679,8 +680,12 @@ def main() -> None:
     args = parser.parse_args()
 
     db_file = os.path.expanduser(args.db)
-    # ensure the local database file and 'tn' table exist
+    # initialize database and create 'tn' table if missing
     ensure_db_schema(db_file)
+    # ensure local DB directory and USB backup directories exist
+    os.makedirs(os.path.dirname(db_file) or '.', exist_ok=True)
+    for dbp in USB_DB_BACKUPS:
+        os.makedirs(os.path.dirname(dbp), exist_ok=True)
     logger.info("Starting tnpy: PLC=%s, DB=%s", args.plc, db_file)
     sync_db_from_backup(db_file)
     monitor_and_update(args.plc, db_file)

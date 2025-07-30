@@ -685,11 +685,26 @@ def main() -> None:
     # ensure local DB directory and USB backup directories exist
     os.makedirs(os.path.dirname(db_file) or '.', exist_ok=True)
     for dbp in USB_DB_BACKUPS:
-        os.makedirs(os.path.dirname(dbp), exist_ok=True)
+        # Only create backup subdirectory if its mount-point exists
+        backup_dir = os.path.dirname(dbp)
+        mount_point = os.path.dirname(backup_dir)
+        if os.path.exists(mount_point):
+            os.makedirs(backup_dir, exist_ok=True)
+        else:
+            logger.debug(f"Mount point {mount_point} not found; skipping directory creation for {dbp}")
     logger.info("Starting tnpy: PLC=%s, DB=%s", args.plc, db_file)
     sync_db_from_backup(db_file)
     monitor_and_update(args.plc, db_file)
 
 
 if __name__ == "__main__":
-    main()
+    # Keep the service alive: restart on any unhandled exception
+    while True:
+        try:
+            main()
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user, exiting.")
+            sys.exit(0)
+        except Exception:
+            logger.exception("Unhandled exception in main, restarting in %ds", RETRY_DELAY)
+            time.sleep(RETRY_DELAY)

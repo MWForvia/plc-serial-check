@@ -30,6 +30,9 @@ from datetime import datetime, timedelta
 import shutil
 import subprocess
 
+# flag to ensure schema is checked only once per process
+_schema_checked = False
+
 # Helper to detect real mount
 # import os  # duplicate import removed
 
@@ -191,6 +194,69 @@ def check_db_integrity(db_path: str) -> bool:
         logger.error("Error checking integrity of %s: %s", db_path, e)
         return False
     return True
+
+# --- USB DB repair at startup and on mount events ---
+def repair_usb_dbs(local_db: str) -> None:
+    """Check integrity and existence of DBs on USB drives and repair from richest source."""
+    try:
+        db_paths = [local_db]
+        # scan /media for mounted USB directories
+        for name in os.listdir("/media"):
+            mount_point = os.path.join("/media", name)
+            if os.path.isdir(mount_point) and os.path.ismount(mount_point):
+                backup_dir = os.path.join(mount_point, "db_backup900")
+                db_paths.append(os.path.join(backup_dir, os.path.basename(local_db)))
+        # determine healthy DBs and their row counts
+        healthy = {}
+        for p in db_paths:
+            if os.path.exists(p) and check_db_integrity(p):
+                try:
+                    with sqlite3.connect(p) as conn:
+                        count = conn.execute("SELECT COUNT(*) FROM tn").fetchone()[0]
+                    healthy[p] = count
+                except Exception:
+                    pass
+        if not healthy:
+            logger.warning("No healthy DBs found among %s", db_paths)
+            return
+        # choose richest source
+        source = max(healthy, key=healthy.get)
+        # repair missing or corrupted DBs
+        for p in db_paths:
+            if p == source:
+                continue
+            parent = os.path.dirname(p)
+            try:
+                os.makedirs(parent, exist_ok=True)
+                shutil.copy2(source, p)
+                logger.info("Repaired database %s from source %s", p, source)
+            except Exception:
+                logger.exception("Failed to repair database %s", p)
+    except Exception:
+        logger.exception("Unexpected error in repair_usb_dbs")
+
+def usb_monitor(local_db: str) -> None:
+    """Background thread to monitor new USB mounts and repair DBs when plugged in."""
+    prev_mounts = set()
+    while True:
+        try:
+            current_mounts = {
+                os.path.join("/media", name)
+                for name in os.listdir("/media")
+                if os.path.isdir(os.path.join("/media", name)) and os.path.ismount(os.path.join("/media", name))
+            }
+            if not prev_mounts:
+                # initial run at startup
+                repair_usb_dbs(local_db)
+            else:
+                new = current_mounts - prev_mounts
+                if new:
+                    logger.info("Detected new USB mounts: %s", new)
+                    repair_usb_dbs(local_db)
+            prev_mounts = current_mounts
+        except Exception:
+            logger.exception("Error in USB monitor thread")
+        time.sleep(RETRY_DELAY)
 
 # --- Helper functions ---
 
@@ -680,18 +746,23 @@ def main() -> None:
     args = parser.parse_args()
 
     db_file = os.path.expanduser(args.db)
-    # initialize database and create 'tn' table if missing
-    ensure_db_schema(db_file)
+    # initialize database schema once per process
+    global _schema_checked
+    if not _schema_checked:
+        ensure_db_schema(db_file)
+        _schema_checked = True
     # ensure local DB directory and USB backup directories exist
     os.makedirs(os.path.dirname(db_file) or '.', exist_ok=True)
     for dbp in USB_DB_BACKUPS:
-        # Only create backup subdirectory if its mount-point exists
+        # Only create backup subdirectory if its mount-point is actually mounted
         backup_dir = os.path.dirname(dbp)
         mount_point = os.path.dirname(backup_dir)
-        if os.path.exists(mount_point):
+        if os.path.ismount(mount_point):
             os.makedirs(backup_dir, exist_ok=True)
         else:
-            logger.debug(f"Mount point {mount_point} not found; skipping directory creation for {dbp}")
+            logger.debug(f"Mount point {mount_point} not mounted; skipping directory creation for {dbp}")
+    # start USB mount monitor
+    threading.Thread(target=usb_monitor, args=(db_file,), daemon=True).start()
     logger.info("Starting tnpy: PLC=%s, DB=%s", args.plc, db_file)
     sync_db_from_backup(db_file)
     monitor_and_update(args.plc, db_file)

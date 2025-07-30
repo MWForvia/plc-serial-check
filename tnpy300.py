@@ -139,6 +139,25 @@ INSERT_FIELDS = [
     'TLA2_PN','TLA2_TN','TLA2_VPPS','TLA2_DUNS',
     'CONV2_PN','CONV2_TN','CONV2_VPPS','CONV2_DUNS'
 ]
+# initialize local DB & schema if missing
+def init_local_db(db_path: str) -> None:
+    dirpath = os.path.dirname(db_path)
+    os.makedirs(dirpath, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tn (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT,
+                tla1_pn TEXT, tla1_tn TEXT, tla1_vpps TEXT, tla1_duns TEXT,
+                conv1_pn TEXT, conv1_tn TEXT, conv1_vpps TEXT, conv1_duns TEXT,
+                tla2_pn TEXT, tla2_tn TEXT, tla2_vpps TEXT, tla2_duns TEXT,
+                conv2_pn TEXT, conv2_tn TEXT, conv2_vpps TEXT, conv2_duns TEXT
+            )
+            """
+        )
+        conn.commit()
 def read_insert_fields(plc):
     """
     Read all PN/TN/VPPS/DUNS tags in schema order and return a list of values.
@@ -622,6 +641,7 @@ def main() -> None:
 
     db_file = os.path.expanduser(args.db)
     logger.info("Starting tnpy: PLC=%s, DB=%s", args.plc, db_file)
+    init_local_db(db_file)
     sync_db_from_backup(db_file)
     monitor_and_update(args.plc, db_file)
 

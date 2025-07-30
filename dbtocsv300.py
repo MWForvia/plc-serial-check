@@ -83,6 +83,27 @@ logger.addHandler(info_handler)
 logger.addHandler(debug_handler)
 
 
+# ensure local db and table exist
+def init_local_db(db_path: str) -> None:
+    dirpath = os.path.dirname(db_path)
+    os.makedirs(dirpath, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tn (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT,
+                tla1_pn TEXT, tla1_tn TEXT, tla1_vpps TEXT, tla1_duns TEXT,
+                conv1_pn TEXT, conv1_tn TEXT, conv1_vpps TEXT, conv1_duns TEXT,
+                tla2_pn TEXT, tla2_tn TEXT, tla2_vpps TEXT, tla2_duns TEXT,
+                conv2_pn TEXT, conv2_tn TEXT, conv2_vpps TEXT, conv2_duns TEXT
+            )
+            """
+        )
+        conn.commit()
+
+
 def export_csv() -> None:
     """
     Export all rows from 'tn' table to daily CSV files in local and USB directories.
@@ -255,10 +276,12 @@ def backup_db() -> None:
 
 
 def main() -> None:
+    # initialize DB schema
+    init_local_db(DB_PATH)
     while True:
         try:
             export_csv()
-            # individual file‐save messages are logged in write_csv/export_csv
+            # individual file-save messages are logged in write_csv/export_csv
             backup_db()
             # final success message
             logger.info("Export completed successfully.")

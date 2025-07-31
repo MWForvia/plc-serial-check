@@ -29,6 +29,7 @@ from typing import Any
 from datetime import datetime, timedelta
 import shutil
 import subprocess
+import errno  # for catching device errors
 
 # flag to ensure schema is checked only once per process
 _schema_checked = False
@@ -227,11 +228,21 @@ def repair_usb_dbs(local_db: str) -> None:
         for p in db_paths:
             if p == source:
                 continue
+            # skip repair if mount point gone
+            mount_pt = os.path.dirname(os.path.dirname(p))
+            if not os.path.ismount(mount_pt):
+                logger.debug(f"Skipping repair for {p}: mount {mount_pt} not mounted")
+                continue
             parent = os.path.dirname(p)
             try:
                 os.makedirs(parent, exist_ok=True)
                 shutil.copy2(source, p)
                 logger.info("Repaired database %s from source %s", p, source)
+            except OSError as e:
+                if e.errno in (errno.ENODEV, errno.ENOENT):
+                    logger.debug(f"Mount {mount_pt} disappeared during repair of {p}; skipping")
+                    continue
+                logger.exception("Failed to repair database %s", p)
             except Exception:
                 logger.exception("Failed to repair database %s", p)
     except Exception:
@@ -542,9 +553,10 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
 
                 while True:
                     # USB2 presence check: set DB_ERROR flag if missing
-                    if not os.path.ismount(os.path.dirname(USB_DB_BACKUP2)):
+                    mount2 = os.path.dirname(os.path.dirname(USB_DB_BACKUP2))
+                    if not os.path.ismount(mount2):
                         plc.write((PLC_TAGS['TN_DB_ERROR'], True))
-                        logger.error("USB2 mount missing; required for operation")
+                        logger.error(f"USB2 mount missing at {mount2}; required for operation")
                     else:
                         plc.write((PLC_TAGS['TN_DB_ERROR'], False))
 
@@ -780,8 +792,15 @@ def main() -> None:
         if os.path.ismount(mount_point):
             try:
                 os.makedirs(backup_dir, exist_ok=True)
-            except Exception as e:
-                logger.error("Failed to create USB backup directory %s: %s", backup_dir, e)
+            except OSError as e:
+                # suppress 'No such device' / mount gone errors
+                if e.errno in (errno.ENODEV, errno.ENOENT):
+                    logger.debug(
+                        "Mount point %s disappeared before creating %s; skipping",
+                        mount_point, backup_dir
+                    )
+                else:
+                    logger.error("Failed to create USB backup directory %s: %s", backup_dir, e)
         else:
             logger.debug(f"Mount point {mount_point} not mounted; skipping directory creation for {dbp}")
     # start USB mount monitor

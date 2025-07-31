@@ -41,28 +41,39 @@ def is_mounted(path: str) -> bool:
     return os.path.ismount(os.path.dirname(path))
 
 # --- Logging setup ---
-log_dir = Path.home() / "tnpy_logs900"
-log_dir.mkdir(parents=True, exist_ok=True)
+# log directory
+try:
+    log_dir = Path.home() / "tnpy_logs900"
+    log_dir.mkdir(parents=True, exist_ok=True)
+except Exception as e:
+    # logging directory failure should not crash
+    print(f"Warning: cannot create log directory {log_dir}: {e}")
 
 # INFO handler
 info_log = Path.home() / "tnpy900.log"
-info_handler = TimedRotatingFileHandler(
-    filename=str(info_log), when="midnight", interval=1, backupCount=0
-)
-info_handler.suffix = "%Y-%m-%d"
-info_handler.namer = lambda name: str(log_dir / Path(name).name)
-info_handler.setLevel(logging.INFO)
-info_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+try:
+    info_handler = TimedRotatingFileHandler(
+        filename=str(info_log), when="midnight", interval=1, backupCount=0
+    )
+    info_handler.suffix = "%Y-%m-%d"
+    info_handler.namer = lambda name: str(log_dir / Path(name).name)
+    info_handler.setLevel(logging.INFO)
+    info_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+except Exception as e:
+    print(f"Warning: cannot setup info handler: {e}")
 
 # DEBUG handler
 debug_log = Path.home() / "tnpy_debug900.log"
-debug_handler = TimedRotatingFileHandler(
-    filename=str(debug_log), when="midnight", interval=1, backupCount=0
-)
-debug_handler.suffix = "%Y-%m-%d"
-debug_handler.namer = lambda name: str(log_dir / Path(name).name)
-debug_handler.setLevel(logging.DEBUG)
-debug_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+try:
+    debug_handler = TimedRotatingFileHandler(
+        filename=str(debug_log), when="midnight", interval=1, backupCount=0
+    )
+    debug_handler.suffix = "%Y-%m-%d"
+    debug_handler.namer = lambda name: str(log_dir / Path(name).name)
+    debug_handler.setLevel(logging.DEBUG)
+    debug_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+except Exception as e:
+    print(f"Warning: cannot setup debug handler: {e}")
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -113,6 +124,30 @@ PLC_TAGS = {
     'TN_MANUAL_ENTRY':       'TN_Manual_Entry',
 }
 
+# SafePLC: wraps LogixDriver to catch read/write errors and set TN_DB_ERROR instead of crashing
+class SafePLC:
+    def __init__(self, inner):
+        self._inner = inner
+    def read(self, tag):
+        try:
+            return self._inner.read(tag)
+        except Exception:
+            try:
+                self._inner.write((PLC_TAGS['TN_DB_ERROR'], True))
+            except Exception:
+                pass
+            return None
+    def write(self, *args):
+        try:
+            return self._inner.write(*args)
+        except Exception:
+            try:
+                self._inner.write((PLC_TAGS['TN_DB_ERROR'], True))
+            except Exception:
+                pass
+    def __getattr__(self, attr):
+        return getattr(self._inner, attr)
+
 SQL_STATEMENTS = {
     'insert_tn': (
         "INSERT INTO tn (date, finished_serial, component_serial1, component_serial2, status) "
@@ -130,7 +165,7 @@ def ensure_db_schema(db_path: str) -> None:
         os.makedirs(parent, exist_ok=True)
     except Exception as e:
         logger.error("Failed to create directory for DB %s: %s", parent, e)
-        sys.exit(1)
+        # continue without exiting, PLC will handle error
     try:
         with sqlite3.connect(db_path) as conn:
             conn.execute(
@@ -149,7 +184,7 @@ def ensure_db_schema(db_path: str) -> None:
             logger.debug("Ensured schema for database %s", db_path)
     except Exception as e:
         logger.error("Failed to create database schema on %s: %s", db_path, e)
-        sys.exit(1)
+        # continue without exiting
 
 POLL_INTERVAL      = 0.5   # general polling interval
 FAST_POLL_INTERVAL = 0.1   # fast polling for fail/datastore
@@ -174,11 +209,30 @@ def reformat_usb(mount_point: str) -> None:
     """
     Unmount, format as FAT32, and remount the USB at mount_point.
     """
-    dev = get_device_for_mount(mount_point)
-    subprocess.run(["umount", mount_point], check=True)
-    subprocess.run(["mkfs.vfat", "-F", "32", dev], check=True)
-    subprocess.run(["mount", dev, mount_point], check=True)
-    logger.info("Reformatted and remounted %s (%s)", mount_point, dev)
+    # only reformat primary USB drive, never touch usbdrive2
+    if os.path.normpath(mount_point) != os.path.normpath('/media/usbdrive'):
+        logger.debug("reformat_usb: skipping non-primary mount %s", mount_point)
+        return
+    # 'return' here only exits this function, script continues running
+    try:
+        dev = get_device_for_mount(mount_point)
+        subprocess.run(["umount", mount_point], check=True)
+        # format as exFAT (keep exfat on usbdrive)
+        subprocess.run(["mkfs.exfat", dev], check=True)
+        subprocess.run(["mount", dev, mount_point], check=True)
+        logger.info("Reformatted and remounted %s (%s)", mount_point, dev)
+    except subprocess.CalledProcessError as e:
+        logger.error("Formatting failed on %s: %s", mount_point, e)
+        # only set error for primary USB drive, not usbdrive2
+        if os.path.normpath(mount_point) == os.path.normpath('/media/usbdrive'):
+            try:
+                plc = globals().get('plc')
+                if plc:
+                    plc.write((PLC_TAGS['TN_DB_ERROR'], True))
+            except Exception:
+                pass
+    except Exception as e:
+        logger.exception("Unexpected error in reformat_usb for %s", mount_point)
 
 def check_db_integrity(db_path: str) -> bool:
     """
@@ -533,7 +587,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
         state = False
         while True:
             try:
-                plc.write((PLC_TAGS['PI_HEARTBEAT'], state))
+                plc.write(PLC_TAGS['PI_HEARTBEAT'], state)
                 logger.debug("Heartbeat sent: %s", state)
             except Exception as e:
                 logger.debug("Heartbeat error: %s", e)
@@ -545,7 +599,8 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
         sync_db_from_backup(db_file)
         try:
             logger.debug("Attempting connection to PLC at %s", plc_ip_address)
-            with LogixDriver(plc_ip_address) as plc:
+            with LogixDriver(plc_ip_address) as raw_plc:
+                plc = SafePLC(raw_plc)
                 # expose plc globally for error flag writes
                 globals()['plc'] = plc
                 threading.Thread(target=heartbeat_loop, args=(plc,), daemon=True).start()
@@ -697,6 +752,10 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                 # If we're at step 143, enforce unique finished_serial
                                 if plc.read(PLC_TAGS['SEQ_STEP']).value == 143:
                                     while True:
+                                    # exit duplicate serial loop on reset
+                                        seq = plc.read(PLC_TAGS['SEQ_STEP'])
+                                        if seq and seq.value == 0:
+                                            break
                                         raw_fs = plc.read(PLC_TAGS['SERIAL_HOLDER']).value or ""
                                         tla_sn = raw_fs[1:] if raw_fs.startswith('T') else raw_fs
 
@@ -783,8 +842,12 @@ def main() -> None:
     if not _schema_checked:
         ensure_db_schema(db_file)
         _schema_checked = True
-    # ensure local DB directory and USB backup directories exist
-    os.makedirs(os.path.dirname(db_file) or '.', exist_ok=True)
+    # ensure local DB directory exists
+    try:
+        os.makedirs(os.path.dirname(db_file) or '.', exist_ok=True)
+    except Exception as e:
+        logger.error("Failed to create local DB directory %s: %s", os.path.dirname(db_file), e)
+    # ensure USB backup directories exist if mounted
     for dbp in USB_DB_BACKUPS:
         # Only create backup subdirectory if its mount-point is actually mounted
         backup_dir = os.path.dirname(dbp)

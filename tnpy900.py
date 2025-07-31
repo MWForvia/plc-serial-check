@@ -541,6 +541,13 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                 logger.info("PLC connection established.")
 
                 while True:
+                    # USB2 presence check: set DB_ERROR flag if missing
+                    if not os.path.ismount(os.path.dirname(USB_DB_BACKUP2)):
+                        plc.write((PLC_TAGS['TN_DB_ERROR'], True))
+                        logger.error("USB2 mount missing; required for operation")
+                    else:
+                        plc.write((PLC_TAGS['TN_DB_ERROR'], False))
+
                     wait_for_tag(plc, 'SCAN_COMPLETE')
                     with sqlite3.connect(db_file) as conn:
                         cursor = conn.cursor()

@@ -290,7 +290,9 @@ def sync_db_from_backup(local_db: str) -> None:
                                 date TEXT,
                                 finished_serial TEXT,
                                 component_serial1 TEXT,
+                                component_serial1_date TEXT,
                                 component_serial2 TEXT,
+                                component_serial2_date TEXT,
                                 status TEXT
                             )
                             """
@@ -350,8 +352,10 @@ def sync_db_from_backup(local_db: str) -> None:
                 ).fetchone()[0]
                 if new_count > 0:
                     tgt_conn.execute(
-                        "INSERT INTO tn(date, finished_serial, component_serial1, component_serial2, status) "
-                        "SELECT date, finished_serial, component_serial1, component_serial2, status "
+                        "INSERT INTO tn(date, finished_serial, component_serial1, component_serial1_date, "
+                        "component_serial2, component_serial2_date, status) "
+                        "SELECT date, finished_serial, component_serial1, component_serial1_date, "
+                        "component_serial2, component_serial2_date, status "
                         "FROM src.tn WHERE id > ?", (max_id,)
                     )
                     tgt_conn.commit()

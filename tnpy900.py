@@ -29,6 +29,8 @@ from typing import Any
 from datetime import datetime, timedelta
 import errno
 import json
+import socket
+socket.setdefaulttimeout(None)
 
 # helper to open SQLite in WAL mode with relaxed sync
 def get_db_connection(path: str, timeout: float = 1.0) -> sqlite3.Connection:
@@ -453,19 +455,44 @@ def wait_for_tag(plc: LogixDriver, tag_key: str) -> None:
 
 
 def wait_for_datastore_or_reset(plc: LogixDriver) -> bool:
+    """
+    Edge-detect the DATASTORE tag: wait for false→true, return True, or exit on reset.
+    """
+    # ensure starting from false
     while True:
-        ds = plc.read(PLC_TAGS['DATASTORE'])
         rs = plc.read(PLC_TAGS['SEQ_STEP'])
         if rs and rs.value == 0:
             return False
+        ds = plc.read(PLC_TAGS['DATASTORE'])
+        if ds and not ds.value:
+            break
+        time.sleep(FAST_POLL_INTERVAL)
+    # now wait for true or reset
+    while True:
+        rs = plc.read(PLC_TAGS['SEQ_STEP'])
+        if rs and rs.value == 0:
+            return False
+        ds = plc.read(PLC_TAGS['DATASTORE'])
         if ds and ds.value:
             return True
         time.sleep(FAST_POLL_INTERVAL)
 
 
 def wait_for_fail_or_reset(plc: LogixDriver) -> bool:
+    """
+    Edge-detect the PART_FAIL tag: wait for false→true, return True, or exit on reset.
+    """
+    # ensure starting from false
     while True:
-        # exit on reset
+        rs = plc.read(PLC_TAGS['SEQ_STEP'])
+        if rs and rs.value == 0:
+            return False
+        fl = plc.read(PLC_TAGS['PART_FAIL'])
+        if fl and not fl.value:
+            break
+        time.sleep(FAST_POLL_INTERVAL)
+    # now wait for true or reset
+    while True:
         rs = plc.read(PLC_TAGS['SEQ_STEP'])
         if rs and rs.value == 0:
             return False
@@ -485,14 +512,17 @@ def check_converter_sn(cursor: sqlite3.Cursor, column: str, sn: Any, label: str)
 
 
 def is_leaktest_rerun_allowed(cursor: sqlite3.Cursor, lhconv: Any, rhconv: Any) -> bool:
+    # allow rerun if at least one leak-test failure exists and no rerun pass recorded yet
     cursor.execute(
         "SELECT COUNT(*) FROM tn WHERE component_serial1=? AND component_serial2=? AND status='Part Failed Leaktest'",
         (lhconv, rhconv)
     )
-    if cursor.fetchone()[0] != 1:
+    failure_count = cursor.fetchone()[0]
+    if failure_count < 1:
         return False
+    # check if a leak-test rerun pass already exists
     cursor.execute(
-        "SELECT COUNT(*) FROM tn WHERE (component_serial1=? OR component_serial2=?) AND status!='Part Failed Leaktest'",
+        "SELECT COUNT(*) FROM tn WHERE component_serial1=? AND component_serial2=? AND status LIKE 'Passed - Previously failed leak test.%'",
         (lhconv, rhconv)
     )
     return cursor.fetchone()[0] == 0
@@ -621,9 +651,12 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
 def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
 
      # create a persistent driver and open session once
-    plc = LogixDriver(plc_ip_address)
+    # set a very long timeout (disable practical CIP timeout)
+    plc = LogixDriver(plc_ip_address, timeout=86400.0)
     try:
         plc.open()
+        # disable OS-level socket timeouts
+        plc._cli.socket.settimeout(None)
         logger.info("PLC connection established.")
         globals()['plc'] = plc
     except Exception as e:
@@ -649,20 +682,14 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
         try:
             # main scan loop
             while True:
-                # wait for SCAN_COMPLETE to be set
-                while True:
-                    val = plc.read(PLC_TAGS['SCAN_COMPLETE'])
-                    if val and val.value:
-                        break
-                    time.sleep(POLL_INTERVAL)
+                # wait for new SCAN_COMPLETE event (false→true)
+                wait_for_tag(plc, 'SCAN_COMPLETE')
                 # batch read converter values and record start time
                 read_start = time.time()
                 # reuse persistent connection
                 cursor = conn.cursor()
-                results = plc.read_list([
-                    PLC_TAGS['LH_CONV'], PLC_TAGS['RH_CONV'],
-                    PLC_TAGS['FIRST_PIECE_CHECK']
-                ])
+                tags = [PLC_TAGS['LH_CONV'], PLC_TAGS['RH_CONV'], PLC_TAGS['FIRST_PIECE_CHECK']]
+                results = [plc.read(tag) for tag in tags]
                 read_latency = time.time() - read_start
                 # record metrics for read latency
                 metrics_logger.info(json.dumps({
@@ -719,6 +746,42 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                 # 2) Rework Mode
                 rework = plc.read(PLC_TAGS['REWORK_MODE'])
                 if rework and rework.value:
+                    # enforce DB gating for rework leak-test reruns
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM tn WHERE component_serial1=? AND component_serial2=? AND status='Passed'",
+                        (lhconv, rhconv)
+                    )
+                    pass_count = cursor.fetchone()[0]
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM tn WHERE component_serial1=? AND component_serial2=? AND status='Part Failed Leaktest'",
+                        (lhconv, rhconv)
+                    )
+                    fail_count = cursor.fetchone()[0]
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM tn WHERE component_serial1=? AND component_serial2=? AND status LIKE 'Passed - Previously failed leak test.%'",
+                        (lhconv, rhconv)
+                    )
+                    rerunpass_count = cursor.fetchone()[0]
+                    # allow only if exactly one initial pass, or at least one fail and one rerun-pass
+                    if not (pass_count == 1 or (fail_count >= 1 and rerunpass_count >= 1)):
+                        set_pass(plc, False)
+                        continue
+                    # allow unlimited leak-test reruns during rework
+                    leak = plc.read(PLC_TAGS['LEAK_TEST_FAIL'])
+                    if leak and leak.value:
+                        status = "Part Failed Leaktest"
+                        logger.error(status)
+                        if wait_for_fail_or_reset(plc):
+                            ts = time.strftime('%Y-%m-%d %H:%M:%S')
+                            cursor.execute(SQL_STATEMENTS['insert_tn'],
+                                           (ts,
+                                            'N/A',
+                                            lhconv, extract_julian(lhconv),
+                                            rhconv, extract_julian(rhconv),
+                                            status))
+                            conn.commit()
+                            replicate_tn_to_backups(ts, 'N/A', lhconv, rhconv, status)
+                        continue
                     # choose manual or label path
                     # wait for either label read complete, fault timer, or reset
                     while True:
@@ -892,27 +955,24 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
             plc.close()
             sys.exit(0)
         except CommError as e_comm:
+            # track communication errors
             global error_comm_count
             error_comm_count += 1
             metrics_logger.info(json.dumps({
                 "timestamp": datetime.utcnow().isoformat(),
                 "metric": "comm_error_count", "value": error_comm_count
             }))
-            logger.error("CommError: %s – reconnecting in %ds", e_comm, current_retry)
+            logger.error("CommError: %s – reconnecting immediately", e_comm)
             last_error_time = time.time()
+            # attempt immediate reconnect
             try:
                 plc.close()
             except Exception:
                 pass
-            time.sleep(current_retry)
             try:
                 plc.open()
-                # reset back-off on successful reconnect
-                current_retry = RETRY_DELAY
             except Exception as e:
                 logger.error("Reopen PLC failed: %s", e)
-                # increase retry delay up to cap
-                current_retry = min(current_retry * 2, MAX_RETRY_DELAY)
             continue
         except Exception:
             global error_unexpected_count
@@ -923,7 +983,8 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
             }))
             logger.exception("Unexpected error – retrying in %ds", current_retry)
             last_error_time = time.time()
-            time.sleep(current_retry)
+            # immediate retry without delay
+            # time.sleep(current_retry)
             # increase retry delay up to cap
             current_retry = min(current_retry * 2, MAX_RETRY_DELAY)
             continue

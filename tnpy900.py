@@ -105,7 +105,7 @@ error_unexpected_count = 0
 
 # --- PLC driver import ---
 try:
-    from pycomm3 import LogixDriver, CommError, Subscription
+    from pycomm3 import LogixDriver, CommError
 except ImportError as e:
     logger.error("Required module pycomm3 not found: %s", e)
     sys.exit(1)
@@ -231,7 +231,7 @@ def ensure_db_schema(db_path: str) -> None:
         sys.exit(1)
 
 POLL_INTERVAL      = 0.5   # general polling interval
-FAST_POLL_INTERVAL = 0.1   # fast polling for fail/datastore
+FAST_POLL_INTERVAL = 0.25   # fast polling for fail/datastore
 RETRY_DELAY        = 1    # seconds to wait before first retry
 MAX_RETRY_DELAY    = 5    # maximum seconds to back off on repeated errors
 RESET_BACKOFF_TIMEOUT = 60  # seconds of stability to reset retry delay
@@ -639,18 +639,6 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
     # reset retry delay on fresh loop
     current_retry = RETRY_DELAY
     last_error_time = None
-    # switch to event-driven tag subscription for SCAN_COMPLETE
-    scan_event = threading.Event()
-    def on_scan_complete(tag, item):
-        if item.value:
-            scan_event.set()
-    try:
-        subs = Subscription(plc)
-        subs.add_tag(PLC_TAGS['SCAN_COMPLETE'], on_scan_complete)
-        subs.start()
-        logger.debug("Subscription for SCAN_COMPLETE started")
-    except Exception as e:
-        logger.warning("Failed to start tag subscription: %s", e)
     while True:
         cycle_start = time.time()
          # reset back-off after stability
@@ -661,10 +649,14 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
         try:
             # main scan loop
             while True:
-                # batch read converter values and first-piece flag
+                # wait for SCAN_COMPLETE to be set
+                while True:
+                    val = plc.read(PLC_TAGS['SCAN_COMPLETE'])
+                    if val and val.value:
+                        break
+                    time.sleep(POLL_INTERVAL)
+                # batch read converter values and record start time
                 read_start = time.time()
-                scan_event.wait()
-                scan_event.clear()
                 # reuse persistent connection
                 cursor = conn.cursor()
                 results = plc.read_list([

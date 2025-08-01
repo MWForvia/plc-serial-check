@@ -31,6 +31,7 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 import traceback  # keep for exception logging
 import sys
+import errno
 
 # Helper to detect a real mount
 def is_mounted(path: str) -> bool:
@@ -103,7 +104,9 @@ def ensure_db_schema(db_path: str) -> None:
                     date TEXT,
                     finished_serial TEXT,
                     component_serial1 TEXT,
+                    component_serial1_date TEXT,
                     component_serial2 TEXT,
+                    component_serial2_date TEXT,
                     status TEXT
                 )
                 """
@@ -127,7 +130,7 @@ def export_csv() -> None:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT id, date, finished_serial, component_serial1, component_serial2, status "
+                "SELECT id, date, finished_serial, component_serial1, component_serial1_date, component_serial2, component_serial2_date, status "
                 "FROM tn"
             )
             rows = cursor.fetchall()
@@ -142,7 +145,7 @@ def export_csv() -> None:
             writer = csv.writer(f, delimiter="\t")
             writer.writerow([
                 "id", "date", "finished_serial",
-                "component_serial1", "component_serial2", "status"
+                "component_serial1", "component_serial1_date", "component_serial2", "component_serial2_date", "status"
             ])
             writer.writerows(rows)
         logger.info(f"CSV file written to {local_path}")
@@ -188,6 +191,23 @@ def backup_db() -> None:
                 shutil.copy2(DB_PATH, str(backup_path))
                 logger.info(f"Initial DB backup created: {backup_path}")
                 continue
+            # Check integrity of existing backup, replace if corrupted
+            try:
+                with sqlite3.connect(str(backup_path)) as chk_conn:
+                    result = chk_conn.execute("PRAGMA integrity_check;").fetchone()[0]
+                if result != "ok":
+                    logger.warning(f"Integrity check failed for {backup_path}: {result}, replacing with live DB")
+                    shutil.copy2(DB_PATH, str(backup_path))
+                    logger.info(f"Replaced corrupted backup DB at {backup_path}")
+                    continue
+            except Exception:
+                logger.exception(f"Integrity check exception for backup DB {backup_path}")
+                try:
+                    shutil.copy2(DB_PATH, str(backup_path))
+                    logger.info(f"Replaced backup DB after exception at {backup_path}")
+                    continue
+                except Exception:
+                    logger.exception(f"Failed to replace backup DB {backup_path} after integrity exception")
 
             # Open backup DB and append only new entries
             with sqlite3.connect(str(backup_path)) as bconn:
@@ -197,7 +217,8 @@ def backup_db() -> None:
                     "CREATE TABLE IF NOT EXISTS tn ("
                     "id INTEGER PRIMARY KEY AUTOINCREMENT, "
                     "date TEXT, finished_serial TEXT, "
-                    "component_serial1 TEXT, component_serial2 TEXT, "
+                    "component_serial1 TEXT, component_serial1_date TEXT, "
+                    "component_serial2 TEXT, component_serial2_date TEXT, "
                     "status TEXT)"
                 )
                 # Find max ID in backup
@@ -212,8 +233,8 @@ def backup_db() -> None:
                 new_count = cur.fetchone()[0]
                 if new_count > 0:
                     bconn.execute(
-                        "INSERT INTO tn(date, finished_serial, component_serial1, component_serial2, status) "
-                        "SELECT date, finished_serial, component_serial1, component_serial2, status "
+                        "INSERT INTO tn(date, finished_serial, component_serial1, component_serial1_date, component_serial2, component_serial2_date, status) "
+                        "SELECT date, finished_serial, component_serial1, component_serial1_date, component_serial2, component_serial2_date, status "
                         "FROM src.tn WHERE id > ?", (max_id,)
                     )
                 bconn.execute("DETACH DATABASE src")
@@ -227,14 +248,35 @@ def backup_db() -> None:
 def main() -> None:
     # create DB file and schema if missing, and ensure CSV/backup dirs exist
     ensure_db_schema(DB_PATH)
+    # ensure CSV export directory exists
     os.makedirs(CSV_DIR, exist_ok=True)
+    # ensure DB backup directories exist (skip unmounted USB paths)
     for d in DB_BACKUP_DIRS:
-        os.makedirs(d, exist_ok=True)
+        # local paths always created; skip USB if unmounted
+        if d.startswith("/media") and not is_mounted(d):
+            logger.debug(f"Skipping directory creation for unmounted path: {d}")
+            continue
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError as e:
+            # suppress common 'no such device' / mount errors
+            if e.errno in (errno.ENODEV, errno.ENOENT):
+                logger.debug(f"Mount disappeared before creating {d}; skipping")
+            else:
+                logger.error(f"Failed to create directory {d}: {e}")
     while True:
         try:
             export_csv()
             # individual file‐save messages are logged in write_csv/export_csv
             backup_db()
+            # Weekly optimize on Sunday
+            if datetime.now().weekday() == 6:
+                try:
+                    with sqlite3.connect(DB_PATH) as conn:
+                        conn.execute("PRAGMA optimize;")
+                    logger.info("Weekly PRAGMA optimize run on database")
+                except Exception:
+                    logger.exception("Weekly PRAGMA optimize failed")
             # final success message
             logger.info("Export completed successfully.")
             break

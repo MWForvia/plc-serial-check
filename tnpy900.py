@@ -892,8 +892,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         # If we're at step 143, enforce unique finished_serial
                         if plc.read(PLC_TAGS['SEQ_STEP']).value == 143:
                             while True:
-                                raw_fs = plc.read(PLC_TAGS['SERIAL_HOLDER']).value or ""
-                                tla_sn = raw_fs[1:] if raw_fs.startswith('T') else raw_fs
+                                tla_sn = plc.read(PLC_TAGS['SERIAL_HOLDER']).value or ""
 
                                 cursor.execute(
                                     "SELECT COUNT(*) FROM tn WHERE finished_serial = ?",

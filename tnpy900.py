@@ -120,18 +120,18 @@ USB_DB_BACKUPS     = [USB_DB_BACKUP, USB_DB_BACKUP2]
 
 PLC_TAGS = {
     # Created tags (for this project)
-    'PI_HEARTBEAT':          'PI_Heartbeat',
-    'TN_CHECK_PASS':         'TN_Check_Pass',
-    'TN_CHECK_FAIL':         'TN_Check_Fail',
-    'TN_DB_ERROR':           'TN_DB_Error',
-    'FIRST_PIECE_CHECK':     'FIRST_PIECE_CHECK',
-    'REWORK_MODE':           'REWORK_MODE',
-    'REWORK_LABEL_DATE':     'REWORK_LABEL_DATE',
-    'REWORK_LABEL_FINISHED': 'REWORK_LABEL_FINISHED',
-    'REWORK_LABEL_LH':       'REWORK_LABEL_LH',
-    'REWORK_LABEL_RH':       'REWORK_LABEL_RH',
-    'TLA_SN_PASS':           'TLA_SN_PASS',
-    'TN_TLA_SN_CHECK_PASS':  'TN_TLA_SN_CHECK_PASS',
+    'TN_CHECK_PASS':         'TN.CHECK_PASS',
+    'TN_CHECK_FAIL':         'TN.CHECK_FAIL',
+    'TN_DB_ERROR':           'TN.DB_ERROR',
+    'FIRST_PIECE_CHECK':     'TN.RABBIT_MODE',
+    'REWORK_MODE':           'TN.REWORK_MODE',
+    'REWORK_LABEL_DATE':     'TN.RW_LABEL_DATE',
+    'REWORK_LABEL_FINISHED': 'TN.RW_LABEL_FINISHED',
+    'REWORK_LABEL_LH':       'TN.RW_LABEL_LH',
+    'REWORK_LABEL_RH':       'TN.RW_LABEL_RH',
+    'TN_MANUAL_ENTRY':       'TN.RW_MANUAL_ENTRY',
+    'TLA_SN_PASS':           'TN.TLA_SN_PASS',
+    'TN_TLA_SN_CHECK_PASS':  'TN.TN_TLA_SN_CHECK_PASS',
     # Existing tags (from the PLC)
     'SERIAL_HOLDER':         'ZEBRA.Working_String[20]',    
     'LH_CONV':               'FIX_513D.Conv_Barcode.EXTRACT[2]',
@@ -146,7 +146,8 @@ PLC_TAGS = {
     'LABEL_READ_COMPLETE':   'FIX_513D.Label_Barcode.READ_COMPLETE',
     'LABEL_BARCODE_EXTRACT': 'FIX_513D.Label_Barcode.EXTRACT[2]',
     'LABEL_FAULT':           'FIX_513D.Label_Barcode.FAULT_TIMER.DN',
-    'TN_MANUAL_ENTRY':       'TN_Manual_Entry',
+    'PART_SELECT':           'FIX_513D.Part_Select',
+    'SERIAL_NUMBER':         'FIX_513D.Serial_Number',
 }
 # centralized error flags tag
 PLC_TAGS['ERROR_FLAGS'] = 'TN_Error_Flags'

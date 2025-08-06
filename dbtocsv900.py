@@ -178,8 +178,8 @@ def backup_db() -> None:
 
     base = os.path.basename(DB_PATH)
     for d in DB_BACKUP_DIRS:
-        # skip unmounted USB backup locations
-        if d.startswith("/media") and not os.path.ismount(d):
+        # skip unmounted USB backup locations (check parent mountpoint)
+        if d.startswith("/media") and not os.path.ismount(os.path.dirname(d)):
             logger.debug(f"Skipping DB backup to unmounted {d}")
             continue
         try:

@@ -119,19 +119,26 @@ USB_DB_BACKUP2     = "/media/usbdrive2/db_backup900/tndb900.db"
 USB_DB_BACKUPS     = [USB_DB_BACKUP, USB_DB_BACKUP2]
 
 PLC_TAGS = {
-    # Created tags (for this project)
+    # New tags (project)
+    # Control flow
     'TN_CHECK_PASS':         'TN.CHECK_PASS',
     'TN_CHECK_FAIL':         'TN.CHECK_FAIL',
+
+    # Error & diagnostic
     'TN_DB_ERROR':           'TN.DB_ERROR',
+    'DB_ERROR_INFO':         'TN.DB_ERROR_INFO',
+    'TN_MESSAGE':            'TN.Message',
+
+    # Processing flow
     'FIRST_PIECE_CHECK':     'TN.RABBIT_MODE',
     'REWORK_MODE':           'TN.REWORK_MODE',
-    'REWORK_LABEL_DATE':     'TN.RW_LABEL_DATE',
     'REWORK_LABEL_FINISHED': 'TN.RW_LABEL_FINISHED',
-    'REWORK_LABEL_LH':       'TN.RW_LABEL_LH',
-    'REWORK_LABEL_RH':       'TN.RW_LABEL_RH',
     'TN_MANUAL_ENTRY':       'TN.RW_MANUAL_ENTRY',
+
+    # TLA duplicate handling
     'TLA_SN_PASS':           'TN.TLA_SN_PASS',
-    'TN_TLA_SN_CHECK_PASS':  'TN.TN_TLA_SN_CHECK_PASS',
+    'TN_TLA_SN_CHECK_PASS':  'TN.TLA_SN_CHECK_PASS',
+
     # Existing tags (from the PLC)
     'SERIAL_HOLDER':         'ZEBRA.Working_String[20]',    
     'LH_CONV':               'FIX_513D.Conv_Barcode.EXTRACT[2]',
@@ -149,8 +156,6 @@ PLC_TAGS = {
     'PART_SELECT':           'FIX_513D.Part_Select',
     'SERIAL_NUMBER':         'FIX_513D.Serial_Number',
 }
-# centralized error flags tag
-PLC_TAGS['ERROR_FLAGS'] = 'TN_Error_Flags'
 
 SQL_STATEMENTS = {
     # now includes component_serial?_date for faster date-scoped lookups
@@ -168,29 +173,19 @@ def extract_julian(serial: Any) -> str:
     s = str(serial or "")
     return s[2:7] if len(s) >= 7 else ""
 
-# error code bitmasks for PLC error flags
-ERROR_CODES = {
-    'DB_ERROR':       0x01,  # database write or schema error
-    'COMM_ERROR':     0x02,  # communication error with PLC
-    'UNEXPECTED':     0x04,  # any unexpected exception
+# Detailed DB error info codes for TN.DB_ERROR_INFO
+DB_ERROR_INFO_CODES = {
+    'SCHEMA_ERROR':        1,  # failed to create or migrate schema
+    'WRITE_ERROR':         2,  # failed to write record to DB
+    'REWORK_LOOKUP_ERROR': 3,  # failed during rework DB lookup
 }
-# current error flags state
-error_flags = 0
-
-def set_error_flag(code: str, state: bool) -> None:
-    """Set or clear a PLC error flag bit and write to PLC."""
-    global error_flags
-    bit = ERROR_CODES.get(code, 0)
-    if state:
-        error_flags |= bit
-    else:
-        error_flags &= ~bit
+# helper to write a message string back to PLC TN.Message tag
+def write_plc_message(plc: LogixDriver, message: str) -> None:
+    """Write a message to the TN.Message PLC tag."""
     try:
-        plc = globals().get('plc')
-        if plc:
-            plc.write((PLC_TAGS['ERROR_FLAGS'], error_flags))
+        plc.write((PLC_TAGS['TN_MESSAGE'], message))
     except Exception:
-        pass
+        logger.exception("Failed to write PLC message")
 
 # Ensure local DB file exists and has the required schema
 def ensure_db_schema(db_path: str) -> None:
@@ -202,6 +197,14 @@ def ensure_db_schema(db_path: str) -> None:
         os.makedirs(parent, exist_ok=True)
     except Exception as e:
         logger.error("Failed to create directory for DB %s: %s", parent, e)
+        # report schema error to PLC
+        try:
+            plc = globals().get('plc')
+            if plc:
+                plc.write((PLC_TAGS['TN_DB_ERROR'], True))
+                plc.write((PLC_TAGS['DB_ERROR_INFO'], DB_ERROR_INFO_CODES['SCHEMA_ERROR']))
+        except Exception:
+            pass
         sys.exit(1)
     try:
         with get_db_connection(db_path) as conn:
@@ -231,6 +234,14 @@ def ensure_db_schema(db_path: str) -> None:
             logger.debug("Ensured schema for database %s", db_path)
     except Exception as e:
         logger.error("Failed to create database schema on %s: %s", db_path, e)
+        # report schema error to PLC
+        try:
+            plc = globals().get('plc')
+            if plc:
+                plc.write((PLC_TAGS['TN_DB_ERROR'], True))
+                plc.write((PLC_TAGS['DB_ERROR_INFO'], DB_ERROR_INFO_CODES['SCHEMA_ERROR']))
+        except Exception:
+            pass
         sys.exit(1)
 
 POLL_INTERVAL      = 0.5   # general polling interval
@@ -558,21 +569,23 @@ def insert_tn_record(db_path: str, timestamp: str, finished_serial: Any,
                           rhconv, extract_julian(rhconv),
                           status))
             conn2.commit()
-            # clear DB error flag on success
+            # clear DB error flag and detailed info on success
             try:
                 plc = globals().get('plc')
                 if plc:
                     plc.write((PLC_TAGS['TN_DB_ERROR'], False))
+                    plc.write((PLC_TAGS['DB_ERROR_INFO'], 0))
             except Exception:
                 pass
             logger.info("Data stored in USB backup database: %s", db_path)
     except Exception as e:
         logger.error("Failed to write TN record to USB backup DB %s: %s", db_path, e)
-        # set DB error flag on failure
+        # set DB error flag and detailed info on failure
         try:
             plc = globals().get('plc')
             if plc:
                 plc.write((PLC_TAGS['TN_DB_ERROR'], True))
+                plc.write((PLC_TAGS['DB_ERROR_INFO'], DB_ERROR_INFO_CODES['WRITE_ERROR']))
         except Exception:
             pass
 
@@ -593,6 +606,7 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
     if leak and leak.value:
         status = "Part Failed Leaktest"
         logger.error(status)
+        write_plc_message(plc, status)
         if wait_for_fail_or_reset(plc):
             ts = time.strftime('%Y-%m-%d %H:%M:%S')
             cursor.execute(SQL_STATEMENTS['insert_tn'],
@@ -636,6 +650,7 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
     first_tla = row[0] if row and row[0] else "Unknown"
     status = f"{base_status} (first TLA: {first_tla})"
     logger.error(status)
+    write_plc_message(plc, status)
     if wait_for_fail_or_reset(plc):
         ts = time.strftime('%Y-%m-%d %H:%M:%S')
         cursor.execute(SQL_STATEMENTS['insert_tn'],
@@ -683,6 +698,17 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
         try:
             # main scan loop
             while True:
+                # clear pass/fail and TLA flags on sequence reset
+                if plc.read(PLC_TAGS['SEQ_STEP']).value == 0:
+                    plc.write((PLC_TAGS['TN_CHECK_PASS'], False))
+                    plc.write((PLC_TAGS['TN_CHECK_FAIL'], False))
+                    plc.write((PLC_TAGS['TLA_SN_PASS'], False))
+                    plc.write((PLC_TAGS['TN_TLA_SN_CHECK_PASS'], False))
+                    # clear rework and manual entry and message on reset
+                    plc.write((PLC_TAGS['REWORK_LABEL_FINISHED'], ""))
+                    plc.write((PLC_TAGS['TN_MANUAL_ENTRY'], ""))
+                    plc.write((PLC_TAGS['TN_MESSAGE'], ""))
+                    continue
                 # wait for new SCAN_COMPLETE event (false→true)
                 wait_for_tag(plc, 'SCAN_COMPLETE')
                 # batch read converter values and record start time
@@ -728,7 +754,17 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         lhconv, rhconv
                     )
                     set_pass(plc, True)
-                    if wait_for_datastore_or_reset(plc):
+                    # wait for SEQ_STEP == 143 or reset
+                    while True:
+                        rs = plc.read(PLC_TAGS['SEQ_STEP'])
+                        if rs and rs.value == 0:
+                            # abort on reset
+                            break
+                        if rs and rs.value == 143:
+                            # reached output step
+                            break
+                        time.sleep(POLL_INTERVAL)
+                    if plc.read(PLC_TAGS['SEQ_STEP']).value == 143:
                         finished_serial = plc.read(PLC_TAGS['FINISHED_SERIAL']).value
                         ts = time.strftime('%Y-%m-%d %H:%M:%S')
                         cursor.execute(SQL_STATEMENTS['insert_tn'],
@@ -740,8 +776,8 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         conn.commit()
                         logger.info("Data stored in local database (Leak Test Rerun)")
                         replicate_tn_to_backups(ts, finished_serial,
-                                                 lhconv, rhconv,
-                                                 'Passed - Previously failed leak test.')
+                                               lhconv, rhconv,
+                                               'Passed - Previously failed leak test.')
                     continue
 
                 # 2) Rework Mode
@@ -783,35 +819,28 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             conn.commit()
                             replicate_tn_to_backups(ts, 'N/A', lhconv, rhconv, status)
                         continue
-                    # choose manual or label path
-                    # wait for either label read complete, fault timer, or reset
+                    # wait for rework label finished tag or reset
                     while True:
-                        # exit on reset
+                        # abort on sequence reset
                         seq = plc.read(PLC_TAGS['SEQ_STEP'])
                         if seq and seq.value == 0:
-                            label_mode = None
+                            label_fs = None
                             break
-                        if plc.read(PLC_TAGS['LABEL_READ_COMPLETE']).value:
-                            label_mode = 'auto'
-                            break
-                        if plc.read(PLC_TAGS['LABEL_FAULT']).value:
-                            label_mode = 'manual'
+                        tag = plc.read(PLC_TAGS['REWORK_LABEL_FINISHED'])
+                        if tag and tag.value:
+                            label_fs = tag.value
                             break
                         time.sleep(POLL_INTERVAL)
-                    # common vars
+                    # timestamp for record
                     ts = time.strftime('%Y-%m-%d %H:%M:%S')
-                    if label_mode == 'auto':
-                        # read extracted finished SN
-                        label_fs = plc.read(PLC_TAGS['LABEL_BARCODE_EXTRACT']).value
-                    elif label_mode == 'manual':
-                        # manual HMI entry
-                        label_fs = plc.read(PLC_TAGS['TN_MANUAL_ENTRY']).value
-                    else:
-                        # aborted by reset
+                    if not label_fs:
+                        # aborted or no label provided
                         continue
                     # validate inputs
                     if not label_fs or not lhconv or not rhconv:
                         plc.write((PLC_TAGS['TN_DB_ERROR'], True))
+                        plc.write((PLC_TAGS['DB_ERROR_INFO'], DB_ERROR_INFO_CODES['WRITE_ERROR']))
+                        plc.write((PLC_TAGS['DB_ERROR_INFO'], DB_ERROR_INFO_CODES['WRITE_ERROR']))
                         set_pass(plc, False)
                         logger.error("Rework inputs invalid: FS=%s, LH=%s, RH=%s", label_fs, lhconv, rhconv)
                         if wait_for_fail_or_reset(plc):
@@ -838,6 +867,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         valid = (len(rows) == 1 and total == 1)
                     except Exception as e:
                         plc.write((PLC_TAGS['TN_DB_ERROR'], True))
+                        plc.write((PLC_TAGS['DB_ERROR_INFO'], DB_ERROR_INFO_CODES['REWORK_LOOKUP_ERROR']))
                         logger.exception("Rework DB lookup error")
                         set_pass(plc, False)
                         if wait_for_fail_or_reset(plc):
@@ -888,7 +918,16 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
 
                 if lh_pass and rh_pass:
                     set_pass(plc, True)
-                    if wait_for_datastore_or_reset(plc):
+                    # wait for SEQ_STEP == 143 or reset (perform TLA SN check)
+                    while True:
+                        rs = plc.read(PLC_TAGS['SEQ_STEP'])
+                        if rs and rs.value == 0:
+                            # abort on reset
+                            break
+                        if rs and rs.value == 143:
+                            # reached TLA check point
+                            break
+                        time.sleep(POLL_INTERVAL)
                         # If we're at step 143, enforce unique finished_serial
                         if plc.read(PLC_TAGS['SEQ_STEP']).value == 143:
                             while True:

@@ -629,7 +629,7 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
 
     # 2) Duplicate-SN logic
     if not lh_pass and not rh_pass:
-        base_status = "LH & RH SN Dupe - Failed"
+        base_status = "LH & RH TN Duplicate - Failed"
         cursor.execute(
             "SELECT finished_serial FROM tn "
             "WHERE component_serial1=? OR component_serial2=? "
@@ -637,7 +637,7 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
             (lhconv, rhconv)
         )
     elif not lh_pass:
-        base_status = "LH SN Dupe - Failed"
+        base_status = "LH TN Duplicate - Failed"
         cursor.execute(
             "SELECT finished_serial FROM tn "
             "WHERE component_serial1=? "
@@ -645,7 +645,7 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
             (lhconv,)
         )
     else:
-        base_status = "RH SN Dupe - Failed"
+        base_status = "RH TN Duplicate - Failed"
         cursor.execute(
             "SELECT finished_serial FROM tn "
             "WHERE component_serial2=? "

@@ -123,6 +123,7 @@ PLC_TAGS = {
     # Control flow
     'TN_CHECK_PASS':         'TN.CHECK_PASS',
     'TN_CHECK_FAIL':         'TN.CHECK_FAIL',
+    'SCAN_COMPLETE':         'TN.DB_CHECK_TRIGGER',
 
     # Error & diagnostic
     'TN_DB_ERROR':           'TN.DB_ERROR',
@@ -146,7 +147,6 @@ PLC_TAGS = {
     'DATASTORE':             'FIX_513D.Seq.Data_Store',
     'SEQ_STEP':              'SEQUENCE_STEP',
     'FINISHED_SERIAL':       'ZEBRA.Working_String[20]',
-    'SCAN_COMPLETE':         'FIX_513D.Seq.Conv_Barcode_Passed',
     'PART_FAIL':             'FIX_513D.Seq.Part_Failed[0]',
     'LEAK_TEST_FAIL':        'FIX_513D.Seq.Leak_Test_Failed',
     # Label scanning and manual entry tags
@@ -158,11 +158,11 @@ PLC_TAGS = {
 }
 
 SQL_STATEMENTS = {
-    # now includes component_serial?_date for faster date-scoped lookups
+    # include finished_serial_date and component_serial?_date for faster lookups
     'insert_tn': (
-        "INSERT INTO tn (date, finished_serial, component_serial1, component_serial1_date, "
+        "INSERT INTO tn (date, finished_serial, finished_serial_date, component_serial1, component_serial1_date, "
         "component_serial2, component_serial2_date, status) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)"
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
     )
 }
 
@@ -303,6 +303,7 @@ def sync_db_from_backup(local_db: str) -> None:
                                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                                 date TEXT,
                                 finished_serial TEXT,
+                                finished_serial_date TEXT,
                                 component_serial1 TEXT,
                                 component_serial1_date TEXT,
                                 component_serial2 TEXT,
@@ -312,7 +313,11 @@ def sync_db_from_backup(local_db: str) -> None:
                             """
                         )
                         init_conn.commit()
-                    logger.debug("Created and initialized new backup DB at %s", path)
+                        # create indexes on new backup DB
+                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished ON tn(finished_serial);")
+                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished_date ON tn(finished_serial_date);")
+                        init_conn.commit()
+                        logger.debug("Created and initialized new backup DB at %s", path)
                 except Exception:
                     row_ids[name] = -1
                     logger.exception("Failed to initialize DB at %s", path)
@@ -565,6 +570,7 @@ def insert_tn_record(db_path: str, timestamp: str, finished_serial: Any,
             cur2.execute(SQL_STATEMENTS['insert_tn'],
                          (timestamp,
                           finished_serial,
+                          extract_julian(finished_serial),
                           lhconv, extract_julian(lhconv),
                           rhconv, extract_julian(rhconv),
                           status))
@@ -612,6 +618,7 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
             cursor.execute(SQL_STATEMENTS['insert_tn'],
                            (ts,
                             'N/A',
+                            extract_julian('N/A'),
                             lhconv, extract_julian(lhconv),
                             rhconv, extract_julian(rhconv),
                             status))
@@ -704,10 +711,10 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                     plc.write((PLC_TAGS['TN_CHECK_FAIL'], False))
                     plc.write((PLC_TAGS['TLA_SN_PASS'], False))
                     plc.write((PLC_TAGS['TN_TLA_SN_CHECK_PASS'], False))
-                    # clear rework and manual entry and message on reset
                     plc.write((PLC_TAGS['REWORK_LABEL_FINISHED'], ""))
                     plc.write((PLC_TAGS['TN_MANUAL_ENTRY'], ""))
                     plc.write((PLC_TAGS['TN_MESSAGE'], ""))
+                    plc.write((PLC_TAGS['SCAN_COMPLETE'], False))
                     continue
                 # wait for new SCAN_COMPLETE event (false→true)
                 wait_for_tag(plc, 'SCAN_COMPLETE')
@@ -738,6 +745,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         cursor.execute(SQL_STATEMENTS['insert_tn'],
                                        (ts,
                                         finished_serial,
+                                        extract_julian(finished_serial),
                                         lhconv, extract_julian(lhconv),
                                         rhconv, extract_julian(rhconv),
                                         'First Piece Check'))
@@ -770,6 +778,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         cursor.execute(SQL_STATEMENTS['insert_tn'],
                                        (ts,
                                         finished_serial,
+                                        extract_julian(finished_serial),
                                         lhconv, extract_julian(lhconv),
                                         rhconv, extract_julian(rhconv),
                                         'Passed - Previously failed leak test.'))
@@ -932,10 +941,11 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         if plc.read(PLC_TAGS['SEQ_STEP']).value == 143:
                             while True:
                                 tla_sn = plc.read(PLC_TAGS['SERIAL_HOLDER']).value or ""
-
+                                # narrow by Julian date first
+                                date_val = extract_julian(tla_sn)
                                 cursor.execute(
-                                    "SELECT COUNT(*) FROM tn WHERE finished_serial = ?",
-                                    (tla_sn,)
+                                    "SELECT COUNT(*) FROM tn WHERE finished_serial_date = ? AND finished_serial = ?",
+                                    (date_val, tla_sn)
                                 )
                                 dup_count = cursor.fetchone()[0]
                                 if dup_count == 0:

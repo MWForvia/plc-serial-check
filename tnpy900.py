@@ -537,29 +537,22 @@ def wait_for_fail_or_reset(plc: LogixDriver) -> bool:
 
 
 def check_converter_sn(cursor: sqlite3.Cursor, column: str, sn: Any, label: str) -> bool:
-    cursor.execute(f"SELECT 1 FROM tn WHERE {column} = ?", (sn,))
-    if cursor.fetchone():
-        logger.warning("%s Converter SN Failed: %s", label, sn)
+    julian_date = extract_julian(sn)
+    cursor.execute(f"SELECT {column} FROM tn WHERE {column}_date = ?", (julian_date,))
+    matches = cursor.fetchall()
+
+    if not matches:
+        logger.info(f"{label} Converter SN Passed: {sn}")
+        return True
+
+    # Check for a full match with the serial number
+    full_match = any(match[0] == sn for match in matches)
+    if full_match:
+        logger.warning(f"{label} Converter SN Failed: {sn}")
         return False
-    logger.info("%s Converter SN Passed: %s", label, sn)
+
+    logger.info(f"{label} Converter SN Passed: {sn}")
     return True
-
-
-def is_leaktest_rerun_allowed(cursor: sqlite3.Cursor, lhconv: Any, rhconv: Any) -> bool:
-    # allow rerun if at least one leak-test failure exists and no rerun pass recorded yet
-    cursor.execute(
-        "SELECT COUNT(*) FROM tn WHERE component_serial1=? AND component_serial2=? AND status='Part Failed Leaktest'",
-        (lhconv, rhconv)
-    )
-    failure_count = cursor.fetchone()[0]
-    if failure_count < 1:
-        return False
-    # check if a leak-test rerun pass already exists
-    cursor.execute(
-        "SELECT COUNT(*) FROM tn WHERE component_serial1=? AND component_serial2=? AND status LIKE 'Passed - Previously failed leak test.%'",
-        (lhconv, rhconv)
-    )
-    return cursor.fetchone()[0] == 0
 
 
 def set_pass(plc: LogixDriver, passed: bool) -> None:
@@ -775,6 +768,10 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         else:
                             status = "First Piece Check - Passed"
 
+                        # Calculate Julian dates for TLA duplicate check
+                        lhconv_date = extract_julian(lhconv)
+                        rhconv_date = extract_julian(rhconv)
+
                         # Wait for SEQ_STEP to transition to 143 or 0
                         while True:
                             seq_step = plc.read(PLC_TAGS['SEQ_STEP']).value
@@ -800,12 +797,12 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                                            (ts,
                                                             finished_serial,
                                                             extract_julian(finished_serial),
-                                                            lhconv, extract_julian(lhconv),
-                                                            rhconv, extract_julian(rhconv),
+                                                            lhconv, lhconv_date,
+                                                            rhconv, rhconv_date,
                                                             status))
                                             conn.commit()
                                             logger.info(f"Data stored in local database ({status})")
-                                            replicate_tn_to_backups(ts, finished_serial, extract_julian(finished_serial), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), status)
+                                            replicate_tn_to_backups(ts, finished_serial, extract_julian(finished_serial), lhconv, lhconv_date, rhconv, rhconv_date, status)
                                             db_entry_complete = True
                                             break
                                         except sqlite3.IntegrityError:
@@ -924,97 +921,47 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                 # 3) Normal pass / fail
                 logger.debug("Mode 2: Normal Pass/Fail mode.")
                 logger.debug("Normal Pass/Fail mode. LH_CONV: %s, RH_CONV: %s", lhconv, rhconv)
-                lh_pass = check_converter_sn(cursor, 'component_serial1', lhconv, 'LH')
-                rh_pass = check_converter_sn(cursor, 'component_serial2', rhconv, 'RH')
+                # Normal pass/fail logic
+                lhconv_date = extract_julian(lhconv)
+                rhconv_date = extract_julian(rhconv)
+
+                # Check uniqueness of component_serial1 and component_serial2
+                cursor.execute(
+                    "SELECT COUNT(*) FROM tn WHERE component_serial1_date=?",
+                    (lhconv_date,)
+                )
+                lh_match_count = cursor.fetchone()[0]
+
+                cursor.execute(
+                    "SELECT COUNT(*) FROM tn WHERE component_serial2_date=?",
+                    (rhconv_date,)
+                )
+                rh_match_count = cursor.fetchone()[0]
+
+                lh_pass = lh_match_count == 0
+                rh_pass = rh_match_count == 0
 
                 if lh_pass and rh_pass:
                     set_pass(plc, True)
-                    leak_test_failed = False
+                    logger.debug("Both LH_CONV and RH_CONV passed TN check.")
 
-                    while True:
-                        rs = plc.read(PLC_TAGS['SEQ_STEP'])
-                        leak_fail = plc.read(PLC_TAGS['LEAK_TEST_FAIL'])
-
-                        # Handle leak test failure: log status but do not create a database entry
-                        if leak_fail and leak_fail.value:
-                            logger.info("Leak Test Failed - No database entry created")
-                            while True:
-                                rs = plc.read(PLC_TAGS['SEQ_STEP'])
-                                if rs and rs.value == 0:
-                                    # Reset on SEQ_STEP == 0
-                                    break
-                                time.sleep(POLL_INTERVAL)
-                            continue
-
-                        # Use Julian date extract for indexing LH_CONV and RH_CONV
-                        lhconv_date = extract_julian(lhconv)
-                        rhconv_date = extract_julian(rhconv)
-                        cursor.execute(
-                            "SELECT COUNT(*) FROM tn WHERE component_serial1_date=? AND component_serial2_date=?",
-                            (lhconv_date, rhconv_date)
-                        )
-                        match_count = cursor.fetchone()[0]
-
-                        if match_count == 0:
-                            logger.info("No matching records found for LH_CONV and RH_CONV Julian dates.")
-                            set_pass(plc, False)
-                            continue
-
-                        # Prevent duplicate database entries by using db_entry_complete flag
-                        if not db_entry_complete:
-                            try:
-                                logger.debug("Inserting record into database. LH_CONV: %s, RH_CONV: %s, Status: %s", lhconv, rhconv, status)
-                                cursor.execute(
-                                    SQL_STATEMENTS['insert_tn'],
-                                    (ts, tla_sn, date_val, lhconv, lhconv_date, rhconv, rhconv_date, 'Passed')
-                                )
-                                conn.commit()
-                                replicate_tn_to_backups(ts, tla_sn, date_val, lhconv, lhconv_date, rhconv, rhconv_date, 'Passed')
-                                logger.info("Database entry created for pass: Serial=%s", tla_sn)
-                                db_entry_complete = True
-                            except sqlite3.IntegrityError:
-                                logger.info("Attempted to insert a duplicate entry into the database. Skipping insertion.")
-
-                        if rs and rs.value == 0:
-                            # Exit loop on reset
-                            break
-
-                        if rs and rs.value == 143:
-                            # Perform unique check at step 143
-                            tla_sn = plc.read(PLC_TAGS['SERIAL_HOLDER']).value or ""
-                            date_val = extract_julian(tla_sn)
+                    # Prevent duplicate database entries by using db_entry_complete flag
+                    if not db_entry_complete:
+                        try:
+                            logger.debug("Inserting record into database. LH_CONV: %s, RH_CONV: %s", lhconv, rhconv)
                             cursor.execute(
-                                "SELECT COUNT(*) FROM tn WHERE finished_serial_date = ? AND finished_serial = ?",
-                                (date_val, tla_sn)
+                                SQL_STATEMENTS['insert_tn'],
+                                (ts, finished_serial, extract_julian(finished_serial), lhconv, lhconv_date, rhconv, rhconv_date, 'Passed')
                             )
-                            dup_count = cursor.fetchone()[0]
-                            if dup_count == 0:
-                                # No duplicates, proceed to insert database entry
-                                ts = time.strftime('%Y-%m-%d %H:%M:%S')
-                                cursor.execute(
-                                    SQL_STATEMENTS['insert_tn'],
-                                    (ts, tla_sn, date_val, lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Passed')
-                                )
-                                conn.commit()
-                                replicate_tn_to_backups(ts, tla_sn, date_val, lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Passed')
-                                logger.info("Database entry created for pass: Serial=%s", tla_sn)
-
-                                # Update PLC tag
-                                plc.write((PLC_TAGS['TN_TLA_SN_CHECK_PASS'], True))
-                                logger.info("TN_TLA_SN_CHECK_PASS=1 for serial %s", tla_sn)
-                                break
-                            else:
-                                # Increment serial number in PLC if duplicates exist
-                                logger.info("Duplicate detected for serial %s during first-piece check. Incrementing serial number.", tla_sn)
-                                part_select = plc.read(PLC_TAGS['PART_SELECT']).value
-                                current_serial = plc.read(f"FIX_513D.Serial_Number[{part_select}]").value
-                                plc.write((f"FIX_513D.Serial_Number[{part_select}]", current_serial + 1))
-                                time.sleep(POLL_INTERVAL)
-
-                    if leak_test_failed:
-                        logger.info("Exiting loop after recording leak test failure.")
+                            conn.commit()
+                            replicate_tn_to_backups(ts, finished_serial, extract_julian(finished_serial), lhconv, lhconv_date, rhconv, rhconv_date, 'Passed')
+                            logger.info("Database entry created for pass: Serial=%s", finished_serial)
+                            db_entry_complete = True
+                        except sqlite3.IntegrityError:
+                            logger.debug("Duplicate entry detected. Skipping insertion.")
                 else:
                     set_pass(plc, False)
+                    logger.debug("Converter serial number check failed. LH_PASS: %s, RH_PASS: %s", lh_pass, rh_pass)
                     handle_fail(lh_pass, rh_pass, plc, cursor, lhconv, rhconv)
 
         except KeyboardInterrupt:

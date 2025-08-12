@@ -492,9 +492,6 @@ def wait_for_datastore_or_reset(plc: LogixDriver) -> bool:
     while True:
         rs = plc.read(PLC_TAGS['SEQ_STEP'])
         if rs and rs.value == 0:
-    while True:
-        rs = plc.read(PLC_TAGS['SEQ_STEP'])
-        if rs and rs.value == 0:
             return False
         ds = plc.read(PLC_TAGS['DATASTORE'])
         if ds and ds.value:

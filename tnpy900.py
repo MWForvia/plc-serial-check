@@ -150,9 +150,6 @@ PLC_TAGS = {
     'PART_FAIL':             'FIX_513D.Seq.Part_Failed[0]',
     'LEAK_TEST_FAIL':        'FIX_513D.Seq.Leak_Test_Failed',
     # Label scanning and manual entry tags
-    'LABEL_READ_COMPLETE':   'FIX_513D.Label_Barcode.READ_COMPLETE',
-    'LABEL_BARCODE_EXTRACT': 'FIX_513D.Label_Barcode.EXTRACT[2]',
-    'LABEL_FAULT':           'FIX_513D.Label_Barcode.FAULT_TIMER.DN',
     'PART_SELECT':           'FIX_513D.Part_Select',
     'SERIAL_NUMBER':         'FIX_513D.Serial_Number',
 }
@@ -196,14 +193,13 @@ def write_plc_message(plc: LogixDriver, message: str) -> None:
 # Ensure local DB file exists and has the required schema
 def ensure_db_schema(db_path: str) -> None:
     """
-    Create the database file and the 'tn' table if they do not exist.
+    Ensure the database file, 'tn' table, and schema are correct before attempting creation.
     """
     parent = os.path.dirname(db_path) or '.'
     try:
         os.makedirs(parent, exist_ok=True)
     except Exception as e:
         logger.error("Failed to create directory for DB %s: %s", parent, e)
-        # report schema error to PLC
         try:
             plc = globals().get('plc')
             if plc:
@@ -212,42 +208,59 @@ def ensure_db_schema(db_path: str) -> None:
         except Exception:
             pass
         sys.exit(1)
+
+    expected_columns = {
+        'id': 'INTEGER',
+        'date': 'TEXT',
+        'finished_serial': 'TEXT',
+        'finished_serial_date': 'TEXT',
+        'component_serial1': 'TEXT',
+        'component_serial1_date': 'TEXT',
+        'component_serial2': 'TEXT',
+        'component_serial2_date': 'TEXT',
+        'status': 'TEXT'
+    }
+
     try:
         with get_db_connection(db_path) as conn:
-            # create or upgrade 'tn' table including finished_serial_date
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS tn (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date TEXT,
-                    finished_serial TEXT,
-                    finished_serial_date TEXT,
-                    component_serial1 TEXT,
-                    component_serial1_date TEXT,
-                    component_serial2 TEXT,
-                    component_serial2_date TEXT,
-                    status TEXT
+            # Check if the 'tn' table exists
+            table_exists = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='tn';"
+            ).fetchone()
+
+            if not table_exists:
+                # Create the table if it does not exist
+                conn.execute(
+                    """
+                    CREATE TABLE tn (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        date TEXT,
+                        finished_serial TEXT,
+                        finished_serial_date TEXT,
+                        component_serial1 TEXT,
+                        component_serial1_date TEXT,
+                        component_serial2 TEXT,
+                        component_serial2_date TEXT,
+                        status TEXT
+                    )
+                    """
                 )
-                """
-            )
-            conn.commit()
-            # migrate existing DB by adding finished_serial_date column if missing
-            cols = [row[1] for row in conn.execute("PRAGMA table_info('tn');")]
-            if 'finished_serial_date' not in cols:
-                conn.execute("ALTER TABLE tn ADD COLUMN finished_serial_date TEXT;")
                 conn.commit()
-            # create indexes to speed up lookups
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_comp1 ON tn(component_serial1);")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_comp1_date ON tn(component_serial1_date);")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_comp2 ON tn(component_serial2);")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_comp2_date ON tn(component_serial2_date);")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished ON tn(finished_serial);")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished_date ON tn(finished_serial_date);")
-            conn.commit()
-            logger.debug("Ensured schema for database %s", db_path)
+                return
+
+            # Validate the schema of the 'tn' table
+            actual_columns = {
+                row[1]: row[2] for row in conn.execute("PRAGMA table_info('tn');")
+            }
+
+            for col, col_type in expected_columns.items():
+                if col not in actual_columns or actual_columns[col] != col_type:
+                    logger.error("Schema mismatch for column '%s': expected '%s', found '%s'", 
+                                 col, col_type, actual_columns.get(col))
+                    raise ValueError("Schema validation failed for table 'tn'")
+
     except Exception as e:
-        logger.error("Failed to create database schema on %s: %s", db_path, e)
-        # report schema error to PLC
+        logger.error("Failed to validate or create schema for DB %s: %s", db_path, e)
         try:
             plc = globals().get('plc')
             if plc:
@@ -557,6 +570,7 @@ def set_pass(plc: LogixDriver, passed: bool) -> None:
 def insert_tn_record(db_path: str, timestamp: str, finished_serial: Any,
                      finished_serial_date: Any, lhconv: Any, lhconv_date: Any,
                      rhconv: Any, rhconv_date: Any, status: str) -> None:
+    logger.debug("Entering function: insert_tn_record")
     # skip writes to unmounted USB paths; if mounted, ensure directory exists
     if db_path.startswith("/media"):
         if not is_mounted(db_path):
@@ -572,23 +586,26 @@ def insert_tn_record(db_path: str, timestamp: str, finished_serial: Any,
     try:
         with get_db_connection(db_path, timeout=3) as conn2:
             cur2 = conn2.cursor()
-            cur2.execute(SQL_STATEMENTS['insert_tn'],
-                         (timestamp,
-                          finished_serial,
-                          finished_serial_date,
-                          lhconv, lhconv_date,
-                          rhconv, rhconv_date,
-                          status))
-            conn2.commit()
-            # clear DB error flag and detailed info on success
-            try:
-                plc = globals().get('plc')
-                if plc:
-                    plc.write((PLC_TAGS['TN_DB_ERROR'], False))
-                    plc.write((PLC_TAGS['DB_ERROR_INFO'], 0))
-            except Exception:
-                pass
-            logger.info("Data stored in USB backup database: %s", db_path)
+            # only insert if this is the first pass and no prior entry exists
+            if not db_entry_complete:
+                cur2.execute(SQL_STATEMENTS['insert_tn'],
+                             (timestamp,
+                              finished_serial,
+                              finished_serial_date,
+                              lhconv, lhconv_date,
+                              rhconv, rhconv_date,
+                              status))
+                conn2.commit()
+                db_entry_complete = True
+                # clear DB error flag and detailed info on success
+                try:
+                    plc = globals().get('plc')
+                    if plc:
+                        plc.write((PLC_TAGS['TN_DB_ERROR'], False))
+                        plc.write((PLC_TAGS['DB_ERROR_INFO'], 0))
+                except Exception:
+                    pass
+                logger.info("Data stored in USB backup database: %s", db_path)
     except Exception as e:
         logger.error("Failed to write TN record to USB backup DB %s: %s", db_path, e)
         # set DB error flag and detailed info on failure
@@ -599,6 +616,7 @@ def insert_tn_record(db_path: str, timestamp: str, finished_serial: Any,
                 plc.write((PLC_TAGS['DB_ERROR_INFO'], DB_ERROR_INFO_CODES['WRITE_ERROR']))
         except Exception:
             pass
+    logger.debug("Exiting function: insert_tn_record")
 
 
 def replicate_tn_to_backups(timestamp: str, finished_serial: Any, finished_serial_date: Any,
@@ -616,20 +634,8 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
     leak = plc.read(PLC_TAGS['LEAK_TEST_FAIL'])
     if leak and leak.value:
         status = "Part Failed Leaktest"
-        logger.error(status)
+        logger.info("Leak Test Failed - No database entry created")
         write_plc_message(plc, status)
-        if wait_for_fail_or_reset(plc):
-            ts = time.strftime('%Y-%m-%d %H:%M:%S')
-            cursor.execute(SQL_STATEMENTS['insert_tn'],
-                           (ts,
-                            'N/A',
-                            extract_julian('N/A'),
-                            lhconv, extract_julian(lhconv),
-                            rhconv, extract_julian(rhconv),
-                            status))
-            cursor.connection.commit()
-            logger.error("Leak Test Failed - Data stored in database")
-            replicate_tn_to_backups(ts, 'N/A', extract_julian('N/A'), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), status)
         return
 
     # 2) Duplicate-SN logic
@@ -677,7 +683,7 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
 
 
 def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
-
+    logger.debug("Starting monitor_and_update function with PLC IP: %s and DB file: %s", plc_ip_address, db_file)
      # create a persistent driver and open session once
     # set a very long timeout (disable practical CIP timeout)
     plc = LogixDriver(plc_ip_address, timeout=86400.0)
@@ -705,13 +711,16 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
          # reset back-off after stability
         if last_error_time and (time.time() - last_error_time) > RESET_BACKOFF_TIMEOUT:
             current_retry = RETRY_DELAY
-            last_error_time = None
+            last_error_time = None  
             logger.debug("Reset retry delay to %ds after stability period", RETRY_DELAY)
         try:
             # main scan loop
+            db_entry_complete = False  # Initialize the flag
             while True:
                 # clear pass/fail and TLA flags on sequence reset
                 if plc.read(PLC_TAGS['SEQ_STEP']).value == 0:
+                    logger.debug("SEQ_STEP is 0. Resetting flags and db_entry_complete.")
+                    db_entry_complete = False
                     plc.write((PLC_TAGS['TN_CHECK_PASS'], False))
                     plc.write((PLC_TAGS['TN_CHECK_FAIL'], False))
                     plc.write((PLC_TAGS['TLA_SN_PASS'], False))
@@ -722,7 +731,9 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                     plc.write((PLC_TAGS['SCAN_COMPLETE'], False))
                     continue
                 # wait for new SCAN_COMPLETE event (false→true)
+                logger.debug("Waiting for SCAN_COMPLETE tag to transition to True.")
                 wait_for_tag(plc, 'SCAN_COMPLETE')
+                logger.debug("SCAN_COMPLETE tag is True. Proceeding with batch read.")
                 # batch read converter values and record start time
                 read_start = time.time()
                 # reuse persistent connection
@@ -743,93 +754,80 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                 fpc = plc.read(PLC_TAGS['FIRST_PIECE_CHECK'])
                 if fpc_val:
                     logger.info("First Piece Check - test part detected")
-                    set_pass(plc, True)
-                    if wait_for_datastore_or_reset(plc):
-                        finished_serial = plc.read(PLC_TAGS['FINISHED_SERIAL']).value
-                        ts = time.strftime('%Y-%m-%d %H:%M:%S')
-                        cursor.execute(SQL_STATEMENTS['insert_tn'],
-                                       (ts,
-                                        finished_serial,
-                                        extract_julian(finished_serial),
-                                        lhconv, extract_julian(lhconv),
-                                        rhconv, extract_julian(rhconv),
-                                        'First Piece Check'))
-                        conn.commit()
-                        logger.info("Data stored in local database (First Piece Check)")
-                        replicate_tn_to_backups(ts, finished_serial, extract_julian(finished_serial), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'First Piece Check')
-                    continue
+                    logger.debug("Mode 0: First-Piece Check detected.")
 
-                # 1) Leak-test rerun logic
-                if is_leaktest_rerun_allowed(cursor, lhconv, rhconv):
-                    logger.info(
-                        "Rerun allowed for LH=%s, RH=%s due to previous leak test failure.",
-                        lhconv, rhconv
-                    )
+                    # Read LH_CONV and RH_CONV values from PLC
+                    lhconv = plc.read(PLC_TAGS['LH_CONV']).value
+                    rhconv = plc.read(PLC_TAGS['RH_CONV']).value
+
+                    # Always set pass status for first-piece check
                     set_pass(plc, True)
-                    # wait for SEQ_STEP == 143 or reset
-                    while True:
-                        rs = plc.read(PLC_TAGS['SEQ_STEP'])
-                        if rs and rs.value == 0:
-                            # abort on reset
-                            break
-                        if rs and rs.value == 143:
-                            # reached output step
-                            break
-                        time.sleep(POLL_INTERVAL)
+
+                    # Check if SEQ_STEP == 143 for TLA serial number checks
                     if plc.read(PLC_TAGS['SEQ_STEP']).value == 143:
                         finished_serial = plc.read(PLC_TAGS['FINISHED_SERIAL']).value
                         ts = time.strftime('%Y-%m-%d %H:%M:%S')
-                        cursor.execute(SQL_STATEMENTS['insert_tn'],
-                                       (ts,
-                                        finished_serial,
-                                        extract_julian(finished_serial),
-                                        lhconv, extract_julian(lhconv),
-                                        rhconv, extract_julian(rhconv),
-                                        'Passed - Previously failed leak test.'))
-                        conn.commit()
-                        logger.info("Data stored in local database (Leak Test Rerun)")
-                        replicate_tn_to_backups(ts, finished_serial, extract_julian(finished_serial), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Passed - Previously failed leak test.')
-                    continue
 
-                # 2) Rework Mode
+                        # Check for leak test failure
+                        leak = plc.read(PLC_TAGS['LEAK_TEST_FAIL'])
+                        if leak and leak.value:
+                            status = "First Piece Check - Failed Leak Test"
+                        else:
+                            status = "First Piece Check - Passed"
+
+                        # Wait for SEQ_STEP to transition to 143 or 0
+                        while True:
+                            seq_step = plc.read(PLC_TAGS['SEQ_STEP']).value
+
+                            if seq_step == 0:
+                                # Reset the cycle if SEQ_STEP == 0
+                                logger.info("SEQ_STEP reset to 0. Exiting first-piece check.")
+                                break
+
+                            if seq_step == 143:
+                                # Perform TLA serial number checks and increment if duplicates are found
+                                while True:
+                                    cursor.execute(
+                                        "SELECT COUNT(*) FROM tn WHERE finished_serial=?",
+                                        (finished_serial,)
+                                    )
+                                    duplicate_count = cursor.fetchone()[0]
+
+                                    if duplicate_count == 0:
+                                        # No duplicates, proceed to insert database entry
+                                        try:
+                                            cursor.execute(SQL_STATEMENTS['insert_tn'],
+                                                           (ts,
+                                                            finished_serial,
+                                                            extract_julian(finished_serial),
+                                                            lhconv, extract_julian(lhconv),
+                                                            rhconv, extract_julian(rhconv),
+                                                            status))
+                                            conn.commit()
+                                            logger.info(f"Data stored in local database ({status})")
+                                            replicate_tn_to_backups(ts, finished_serial, extract_julian(finished_serial), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), status)
+                                            db_entry_complete = True
+                                            break
+                                        except sqlite3.IntegrityError:
+                                            logger.info("Attempted to insert a duplicate entry into the database. Skipping insertion.")
+                                    else:
+                                        # Increment the serial number if duplicates are found
+                                        logger.info(f"Duplicate TLA serial detected for {finished_serial}. Incrementing serial number.")
+                                        part_select = plc.read(PLC_TAGS['PART_SELECT']).value
+                                        current_serial = plc.read(f"FIX_513D.Serial_Number[{part_select}]").value
+                                        plc.write((f"FIX_513D.Serial_Number[{part_select}]", current_serial + 1))
+                                        finished_serial = f"{finished_serial}_DUP{duplicate_count}"
+                                        time.sleep(POLL_INTERVAL)
+                                break
+
+                            time.sleep(POLL_INTERVAL)
+                        continue
+
+                # 1) Rework Mode
                 rework = plc.read(PLC_TAGS['REWORK_MODE'])
                 if rework and rework.value:
-                    # enforce DB gating for rework leak-test reruns
-                    cursor.execute(
-                        "SELECT COUNT(*) FROM tn WHERE component_serial1=? AND component_serial2=? AND status='Passed'",
-                        (lhconv, rhconv)
-                    )
-                    pass_count = cursor.fetchone()[0]
-                    cursor.execute(
-                        "SELECT COUNT(*) FROM tn WHERE component_serial1=? AND component_serial2=? AND status='Part Failed Leaktest'",
-                        (lhconv, rhconv)
-                    )
-                    fail_count = cursor.fetchone()[0]
-                    cursor.execute(
-                        "SELECT COUNT(*) FROM tn WHERE component_serial1=? AND component_serial2=? AND status LIKE 'Passed - Previously failed leak test.%'",
-                        (lhconv, rhconv)
-                    )
-                    rerunpass_count = cursor.fetchone()[0]
-                    # allow only if exactly one initial pass, or at least one fail and one rerun-pass
-                    if not (pass_count == 1 or (fail_count >= 1 and rerunpass_count >= 1)):
-                        set_pass(plc, False)
-                        continue
-                    # allow unlimited leak-test reruns during rework
-                    leak = plc.read(PLC_TAGS['LEAK_TEST_FAIL'])
-                    if leak and leak.value:
-                        status = "Part Failed Leaktest"
-                        logger.error(status)
-                        if wait_for_fail_or_reset(plc):
-                            ts = time.strftime('%Y-%m-%d %H:%M:%S')
-                            cursor.execute(SQL_STATEMENTS['insert_tn'],
-                                           (ts,
-                                            'N/A', extract_julian('N/A'),   
-                                            lhconv, extract_julian(lhconv),
-                                            rhconv, extract_julian(rhconv),
-                                            status))
-                            conn.commit()
-                            replicate_tn_to_backups(ts, 'N/A', extract_julian('N/A'), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), status)
-                        continue
+                    logger.debug("Mode 1: Rework Mode detected.")
+                    logger.debug("Rework Mode detected. LH_CONV: %s, RH_CONV: %s", lhconv, rhconv)
                     # wait for rework label finished tag or reset
                     while True:
                         # abort on sequence reset
@@ -924,6 +922,8 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                     continue
 
                 # 3) Normal pass / fail
+                logger.debug("Mode 2: Normal Pass/Fail mode.")
+                logger.debug("Normal Pass/Fail mode. LH_CONV: %s, RH_CONV: %s", lhconv, rhconv)
                 lh_pass = check_converter_sn(cursor, 'component_serial1', lhconv, 'LH')
                 rh_pass = check_converter_sn(cursor, 'component_serial2', rhconv, 'RH')
 
@@ -935,16 +935,45 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         rs = plc.read(PLC_TAGS['SEQ_STEP'])
                         leak_fail = plc.read(PLC_TAGS['LEAK_TEST_FAIL'])
 
+                        # Handle leak test failure: log status but do not create a database entry
                         if leak_fail and leak_fail.value:
-                            leak_test_failed = True
-                            ts = time.strftime('%Y-%m-%d %H:%M:%S')
-                            cursor.execute(
-                                SQL_STATEMENTS['insert_tn'],
-                                (ts, 'N/A', extract_julian('N/A'), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Part Failed Leaktest')
-                            )
-                            conn.commit()
-                            replicate_tn_to_backups(ts, 'N/A', extract_julian('N/A'), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Part Failed Leaktest')
-                            logger.info("Leak Test Failed - Data stored in database")
+                            logger.info("Leak Test Failed - No database entry created")
+                            while True:
+                                rs = plc.read(PLC_TAGS['SEQ_STEP'])
+                                if rs and rs.value == 0:
+                                    # Reset on SEQ_STEP == 0
+                                    break
+                                time.sleep(POLL_INTERVAL)
+                            continue
+
+                        # Use Julian date extract for indexing LH_CONV and RH_CONV
+                        lhconv_date = extract_julian(lhconv)
+                        rhconv_date = extract_julian(rhconv)
+                        cursor.execute(
+                            "SELECT COUNT(*) FROM tn WHERE component_serial1_date=? AND component_serial2_date=?",
+                            (lhconv_date, rhconv_date)
+                        )
+                        match_count = cursor.fetchone()[0]
+
+                        if match_count == 0:
+                            logger.info("No matching records found for LH_CONV and RH_CONV Julian dates.")
+                            set_pass(plc, False)
+                            continue
+
+                        # Prevent duplicate database entries by using db_entry_complete flag
+                        if not db_entry_complete:
+                            try:
+                                logger.debug("Inserting record into database. LH_CONV: %s, RH_CONV: %s, Status: %s", lhconv, rhconv, status)
+                                cursor.execute(
+                                    SQL_STATEMENTS['insert_tn'],
+                                    (ts, tla_sn, date_val, lhconv, lhconv_date, rhconv, rhconv_date, 'Passed')
+                                )
+                                conn.commit()
+                                replicate_tn_to_backups(ts, tla_sn, date_val, lhconv, lhconv_date, rhconv, rhconv_date, 'Passed')
+                                logger.info("Database entry created for pass: Serial=%s", tla_sn)
+                                db_entry_complete = True
+                            except sqlite3.IntegrityError:
+                                logger.info("Attempted to insert a duplicate entry into the database. Skipping insertion.")
 
                         if rs and rs.value == 0:
                             # Exit loop on reset
@@ -960,21 +989,27 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             )
                             dup_count = cursor.fetchone()[0]
                             if dup_count == 0:
-                                # Insert database entry for a pass
+                                # No duplicates, proceed to insert database entry
                                 ts = time.strftime('%Y-%m-%d %H:%M:%S')
                                 cursor.execute(
                                     SQL_STATEMENTS['insert_tn'],
                                     (ts, tla_sn, date_val, lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Passed')
                                 )
                                 conn.commit()
-                                replicate_tn_to_backups(ts, tla_sn, date_val, lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Passed')                                
+                                replicate_tn_to_backups(ts, tla_sn, date_val, lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Passed')
                                 logger.info("Database entry created for pass: Serial=%s", tla_sn)
 
                                 # Update PLC tag
                                 plc.write((PLC_TAGS['TN_TLA_SN_CHECK_PASS'], True))
                                 logger.info("TN_TLA_SN_CHECK_PASS=1 for serial %s", tla_sn)
-
-                        time.sleep(POLL_INTERVAL)
+                                break
+                            else:
+                                # Increment serial number in PLC if duplicates exist
+                                logger.info("Duplicate detected for serial %s during first-piece check. Incrementing serial number.", tla_sn)
+                                part_select = plc.read(PLC_TAGS['PART_SELECT']).value
+                                current_serial = plc.read(f"FIX_513D.Serial_Number[{part_select}]").value
+                                plc.write((f"FIX_513D.Serial_Number[{part_select}]", current_serial + 1))
+                                time.sleep(POLL_INTERVAL)
 
                     if leak_test_failed:
                         logger.info("Exiting loop after recording leak test failure.")
@@ -1021,6 +1056,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
             # increase retry delay up to cap
             current_retry = min(current_retry * 2, MAX_RETRY_DELAY)
             continue
+    logger.debug("Exiting function: monitor_and_update")
 
 
 def ensure_all_dbs_initialized():

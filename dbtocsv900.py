@@ -103,7 +103,6 @@ def ensure_db_schema(db_path: str) -> None:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     date TEXT,
                     finished_serial TEXT,
-                    finished_serial_date TEXT,
                     component_serial1 TEXT,
                     component_serial1_date TEXT,
                     component_serial2 TEXT,
@@ -131,7 +130,7 @@ def export_csv() -> None:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT id, date, finished_serial, finished_serial_date, component_serial1, component_serial1_date, component_serial2, component_serial2_date, status "
+                "SELECT id, date, finished_serial, component_serial1, component_serial1_date, component_serial2, component_serial2_date, status "
                 "FROM tn"
             )
             rows = cursor.fetchall()
@@ -145,7 +144,7 @@ def export_csv() -> None:
         with open(local_path, mode="w", newline="") as f:
             writer = csv.writer(f, delimiter="\t")
             writer.writerow([
-                "id", "date", "finished_serial", "finished_serial_date",
+                "id", "date", "finished_serial",
                 "component_serial1", "component_serial1_date", "component_serial2", "component_serial2_date", "status"
             ])
             writer.writerows(rows)
@@ -217,7 +216,7 @@ def backup_db() -> None:
                 bcursor.execute(
                     "CREATE TABLE IF NOT EXISTS tn ("
                     "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                    "date TEXT, finished_serial TEXT, finished_serial_date TEXT, "
+                    "date TEXT, finished_serial TEXT, "
                     "component_serial1 TEXT, component_serial1_date TEXT, "
                     "component_serial2 TEXT, component_serial2_date TEXT, "
                     "status TEXT)"
@@ -234,8 +233,8 @@ def backup_db() -> None:
                 new_count = cur.fetchone()[0]
                 if new_count > 0:
                     bconn.execute(
-                        "INSERT INTO tn(date, finished_serial, finished_serial_date, component_serial1, component_serial1_date, component_serial2, component_serial2_date, status) "
-                        "SELECT date, finished_serial, finished_serial_date, component_serial1, component_serial1_date, component_serial2, component_serial2_date, status "
+                        "INSERT INTO tn(date, finished_serial, component_serial1, component_serial1_date, component_serial2, component_serial2_date, status) "
+                        "SELECT date, finished_serial, component_serial1, component_serial1_date, component_serial2, component_serial2_date, status "
                         "FROM src.tn WHERE id > ?", (max_id,)
                     )
                 bconn.execute("DETACH DATABASE src")

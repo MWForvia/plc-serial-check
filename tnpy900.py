@@ -229,8 +229,11 @@ def ensure_db_schema(db_path: str) -> None:
             )
             conn.commit()
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished_date ON tn(finished_serial_date);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished_date_serial ON tn(finished_serial_date, finished_serial);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component1_date ON tn(component_serial1_date);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component1_date_serial ON tn(component_serial1_date, component_serial1);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component2_date ON tn(component_serial2_date);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component2_date_serial ON tn(component_serial2_date, component_serial2);")
             conn.commit()
     except Exception as e:
         logger.error("Failed to ensure schema for database %s: %s", db_path, e)
@@ -315,8 +318,11 @@ def sync_db_from_backup(local_db: str) -> None:
                         # create indexes on new backup DB
                         init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished ON tn(finished_serial);")
                         init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished_date ON tn(finished_serial_date);")
+                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished_date_serial ON tn(finished_serial_date, finished_serial);")
                         init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component1_date ON tn(component_serial1_date);")
+                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component1_date_serial ON tn(component_serial1_date, component_serial1);")
                         init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component2_date ON tn(component_serial2_date);")
+                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component2_date_serial ON tn(component_serial2_date, component_serial2);")
                         init_conn.commit()
                         logger.debug("Created and initialized new backup DB at %s", path)
                 except Exception:
@@ -361,8 +367,9 @@ def sync_db_from_backup(local_db: str) -> None:
                 tgt_cur.execute(
                     "CREATE TABLE IF NOT EXISTS tn ("
                     "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                    "date TEXT, finished_serial TEXT, "
-                    "component_serial1 TEXT, component_serial2 TEXT, status TEXT)"
+                    "date TEXT, finished_serial TEXT, finished_serial_date TEXT, "
+                    "component_serial1 TEXT, component_serial1_date TEXT, "
+                    "component_serial2 TEXT, component_serial2_date TEXT, status TEXT)"
                 )
                 tgt_cur.execute("SELECT MAX(id) FROM tn")
                 max_id = tgt_cur.fetchone()[0] or 0
@@ -372,9 +379,9 @@ def sync_db_from_backup(local_db: str) -> None:
                 ).fetchone()[0]
                 if new_count > 0:
                     tgt_conn.execute(
-                        "INSERT INTO tn(date, finished_serial, component_serial1, component_serial1_date, "
+                        "INSERT INTO tn(date, finished_serial, finished_serial_date, component_serial1, component_serial1_date, "
                         "component_serial2, component_serial2_date, status) "
-                        "SELECT date, finished_serial, component_serial1, component_serial1_date, "
+                        "SELECT date, finished_serial, finished_serial_date, component_serial1, component_serial1_date, "
                         "component_serial2, component_serial2_date, status "
                         "FROM src.tn WHERE id > ?", (max_id,)
                     )
@@ -406,6 +413,7 @@ def sync_local_to_target(local_db: str, target_db: str) -> None:
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         date TEXT,
                         finished_serial TEXT,
+                        finished_serial_date TEXT,
                         component_serial1 TEXT,
                         component_serial1_date TEXT,
                         component_serial2 TEXT,
@@ -414,6 +422,14 @@ def sync_local_to_target(local_db: str, target_db: str) -> None:
                     )
                     """
                 )
+                init_conn.commit()
+                # Ensure indexes used by lookups exist on fresh targets
+                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished_date ON tn(finished_serial_date);")
+                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished_date_serial ON tn(finished_serial_date, finished_serial);")
+                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component1_date ON tn(component_serial1_date);")
+                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component1_date_serial ON tn(component_serial1_date, component_serial1);")
+                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component2_date ON tn(component_serial2_date);")
+                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component2_date_serial ON tn(component_serial2_date, component_serial2);")
                 init_conn.commit()
             logger.debug("Initialized target DB for one-way sync at %s", target_db)
         except Exception:
@@ -429,9 +445,9 @@ def sync_local_to_target(local_db: str, target_db: str) -> None:
             ).fetchone()[0]
             if new_count > 0:
                 tgt_conn.execute(
-                    "INSERT INTO tn(date, finished_serial, component_serial1, component_serial1_date, "
+                    "INSERT INTO tn(date, finished_serial, finished_serial_date, component_serial1, component_serial1_date, "
                     "component_serial2, component_serial2_date, status) "
-                    "SELECT date, finished_serial, component_serial1, component_serial1_date, "
+                    "SELECT date, finished_serial, finished_serial_date, component_serial1, component_serial1_date, "
                     "component_serial2, component_serial2_date, status "
                     "FROM src.tn WHERE id > ?", (max_id,)
                 )
@@ -868,14 +884,28 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         continue
                     # DB lookup
                     try:
+                        # Use date-index narrowing for each field, then exact value match for consistency and speed
                         cursor.execute(
-                            "SELECT id FROM tn WHERE finished_serial=? AND component_serial1=? AND component_serial2=?",
-                            (label_fs, lhconv, rhconv)
+                            "SELECT id FROM tn WHERE finished_serial_date=? AND finished_serial=? "
+                            "AND component_serial1_date=? AND component_serial1=? "
+                            "AND component_serial2_date=? AND component_serial2=?",
+                            (
+                                extract_julian(label_fs), label_fs,
+                                extract_julian(lhconv), lhconv,
+                                extract_julian(rhconv), rhconv,
+                            )
                         )
                         rows = cursor.fetchall()
+                        # Keep existing uniqueness heuristic but make it date-indexed for consistency
                         cursor.execute(
-                            "SELECT COUNT(*) FROM tn WHERE finished_serial=? OR component_serial1=? OR component_serial2=?",
-                            (label_fs, lhconv, rhconv)
+                            "SELECT COUNT(*) FROM tn WHERE (finished_serial_date=? AND finished_serial=?) "
+                            "OR (component_serial1_date=? AND component_serial1=?) "
+                            "OR (component_serial2_date=? AND component_serial2=?)",
+                            (
+                                extract_julian(label_fs), label_fs,
+                                extract_julian(lhconv), lhconv,
+                                extract_julian(rhconv), rhconv,
+                            )
                         )
                         total = cursor.fetchone()[0]
                         valid = (len(rows) == 1 and total == 1)

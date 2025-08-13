@@ -642,49 +642,76 @@ def replicate_tn_to_backups(timestamp: str, finished_serial: Any, finished_seria
                 pass
 
 
+def record_and_signal_failure(plc: LogixDriver, cursor: sqlite3.Cursor,
+                              finished_serial: Any, lhconv: Any, rhconv: Any,
+                              status: str) -> None:
+    """
+    Log and write a single failure entry, then drive PLC to fail step (89).
+    This is gated by SEQ_STEP != 89 to prevent repeats; level-trigger only.
+    """
+    try:
+        seq = plc.read(PLC_TAGS['SEQ_STEP'])
+        if seq and seq.value == 89:
+            return  # Already in fail step; do nothing
+
+        ts = time.strftime('%Y-%m-%d %H:%M:%S')
+        fs = finished_serial or 'N/A'
+        fs_date = extract_julian(fs)
+        lh = lhconv or 'N/A'
+        rh = rhconv or 'N/A'
+        cursor.execute(
+            SQL_STATEMENTS['insert_tn'],
+            (ts, fs, fs_date, lh, extract_julian(lh), rh, extract_julian(rh), status)
+        )
+        cursor.connection.commit()
+        replicate_tn_to_backups(ts, fs, fs_date, lh, extract_julian(lh), rh, extract_julian(rh), status)
+        logger.error("Failed TN Check - Data stored in database")
+        write_plc_message(plc, status)
+        # Set PLC fail flags and step
+        try:
+            plc.write((PLC_TAGS['TN_CHECK_PASS'], False))
+            plc.write((PLC_TAGS['TN_CHECK_FAIL'], True))
+            plc.write((PLC_TAGS['SEQ_STEP'], 89))
+        except Exception:
+            logger.exception("Failed to write PLC fail flags/step")
+    except Exception:
+        logger.exception("Failure record/signaling encountered an error")
+
+
 def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
                 cursor: sqlite3.Cursor, lhconv: Any, rhconv: Any) -> None:
-    # Leak-test failures are no longer recorded in the DB; duplicates still are handled below
+    # Leak-test failures are no longer recorded in the DB; duplicates still are handled
+    try:
+        seq = plc.read(PLC_TAGS['SEQ_STEP'])
+        if seq and seq.value == 89:
+            return  # already handled this cycle
 
-    if not lh_pass and not rh_pass:
-        base_status = "LH & RH TN Duplicate - Failed"
-        cursor.execute(
-            "SELECT finished_serial FROM tn WHERE (component_serial1_date = ? AND component_serial1 = ?) OR (component_serial2_date = ? AND component_serial2 = ?) ORDER BY id ASC LIMIT 1",
-            (extract_julian(lhconv), lhconv, extract_julian(rhconv), rhconv)
-        )
-    elif not lh_pass:
-        base_status = "LH TN Duplicate - Failed"
-        cursor.execute(
-            "SELECT finished_serial FROM tn WHERE component_serial1_date = ? AND component_serial1 = ? ORDER BY id ASC LIMIT 1",
-            (extract_julian(lhconv), lhconv)
-        )
-    else:
-        base_status = "RH TN Duplicate - Failed"
-        cursor.execute(
-            "SELECT finished_serial FROM tn WHERE component_serial2_date = ? AND component_serial2 = ? ORDER BY id ASC LIMIT 1",
-            (extract_julian(rhconv), rhconv)
-        )
+        if not lh_pass and not rh_pass:
+            base_status = "LH & RH TN Duplicate - Failed"
+            cursor.execute(
+                "SELECT finished_serial FROM tn WHERE (component_serial1_date = ? AND component_serial1 = ?) OR (component_serial2_date = ? AND component_serial2 = ?) ORDER BY id ASC LIMIT 1",
+                (extract_julian(lhconv), lhconv, extract_julian(rhconv), rhconv)
+            )
+        elif not lh_pass:
+            base_status = "LH TN Duplicate - Failed"
+            cursor.execute(
+                "SELECT finished_serial FROM tn WHERE component_serial1_date = ? AND component_serial1 = ? ORDER BY id ASC LIMIT 1",
+                (extract_julian(lhconv), lhconv)
+            )
+        else:
+            base_status = "RH TN Duplicate - Failed"
+            cursor.execute(
+                "SELECT finished_serial FROM tn WHERE component_serial2_date = ? AND component_serial2 = ? ORDER BY id ASC LIMIT 1",
+                (extract_julian(rhconv), rhconv)
+            )
 
-    row = cursor.fetchone()
-    first_tla = row[0] if row and row[0] else "Unknown"
-    status = f"{base_status} (first TLA: {first_tla})"
-    logger.error(status)
-    write_plc_message(plc, status)
-    if wait_for_fail_or_reset(plc):
-        ts = time.strftime('%Y-%m-%d %H:%M:%S')
-        cursor.execute(SQL_STATEMENTS['insert_tn'],
-                       (ts,
-                        'N/A', extract_julian('N/A'),
-                        lhconv, extract_julian(lhconv),
-                        rhconv, extract_julian(rhconv),
-                        status))
-        cursor.connection.commit()
-        logger.error("Failed TN Check - Data stored in database")
-        replicate_tn_to_backups(ts, 'N/A', extract_julian('N/A'), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), status)
-        logger.info("Exiting handle_fail")
-        return
-
-    logger.info("Exiting handle_fail - no action taken")
+        row = cursor.fetchone()
+        first_tla = row[0] if row and row[0] else "Unknown"
+        status = f"{base_status} (first TLA: {first_tla})"
+        # Record once, then drive PLC to step 89
+        record_and_signal_failure(plc, cursor, 'N/A', lhconv, rhconv, status)
+    except Exception:
+        logger.exception("handle_fail encountered an error")
 
 
 def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
@@ -711,6 +738,12 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
     # reset retry delay on fresh loop
     current_retry = RETRY_DELAY
     last_error_time = None
+    # per-cycle leak-fail log suppression flags (reset when SEQ_STEP returns to 0)
+    leak_logged_normal = False
+    leak_logged_fpc = False
+    leak_logged_rework = False
+    # per-cycle scan consumption flag to avoid reprocessing same SCAN_COMPLETE
+    scan_consumed = False
     while True:
         cycle_start = time.time()
          # reset back-off after stability
@@ -722,17 +755,33 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
             # main scan loop
             while True:
                 # clear pass/fail and TLA flags on sequence reset
-                if plc.read(PLC_TAGS['SEQ_STEP']).value == 0:
+                seq_val = plc.read(PLC_TAGS['SEQ_STEP']).value
+                if seq_val == 0:
                     plc.write((PLC_TAGS['TN_CHECK_PASS'], False))
                     plc.write((PLC_TAGS['TN_CHECK_FAIL'], False))
                     plc.write((PLC_TAGS['TN_TLA_SN_CHECK_PASS'], False))
                     plc.write((PLC_TAGS['REWORK_LABEL_FINISHED'], ""))
                     plc.write((PLC_TAGS['TN_MANUAL_ENTRY'], ""))
                     plc.write((PLC_TAGS['TN_MESSAGE'], ""))
-                    plc.write((PLC_TAGS['SCAN_COMPLETE'], False))
+                    # do not write to SCAN_COMPLETE; reset local flags only
+                    # reset per-cycle leak-fail suppression flags
+                    leak_logged_normal = False
+                    leak_logged_fpc = False
+                    leak_logged_rework = False
+                    scan_consumed = False
+                    continue
+                # If PLC is holding in fail step 89, idle (prevents duplicate logging/inserts)
+                if seq_val == 89:
+                    time.sleep(POLL_INTERVAL)
+                    continue
+                # Prevent duplicate processing if SCAN_COMPLETE remains high: skip until reset
+                if scan_consumed:
+                    time.sleep(POLL_INTERVAL)
                     continue
                 # wait for new SCAN_COMPLETE event (false→true)
                 wait_for_tag(plc, 'SCAN_COMPLETE')
+                # mark as consumed for this cycle; we'll only process once until reset
+                scan_consumed = True
                 # batch read converter values and record start time
                 read_start = time.time()
                 # reuse persistent connection
@@ -759,7 +808,9 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         rs = plc.read(PLC_TAGS['SEQ_STEP'])
                         leak_fail = plc.read(PLC_TAGS['LEAK_TEST_FAIL'])
                         if leak_fail and leak_fail.value:
-                            logger.info("Leak Test Failed during FPC - no DB entry created")
+                            if not leak_logged_fpc:
+                                logger.info("Leak Test Failed during FPC - no DB entry created")
+                                leak_logged_fpc = True
                             break
                         if rs and rs.value == 0:
                             logger.info("Cycle Reset.")
@@ -873,7 +924,9 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         if wait_for_datastore_or_reset(plc):
                             leak_fail = plc.read(PLC_TAGS['LEAK_TEST_FAIL'])
                             if leak_fail and leak_fail.value:
-                                logger.info("Leak Test Failed during Rework - no DB entry created")
+                                if not leak_logged_rework:
+                                    logger.info("Leak Test Failed during Rework - no DB entry created")
+                                    leak_logged_rework = True
                             else:
                                 cursor.execute(
                                     SQL_STATEMENTS['insert_tn'],
@@ -911,7 +964,9 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         rs = plc.read(PLC_TAGS['SEQ_STEP'])
                         leak_fail = plc.read(PLC_TAGS['LEAK_TEST_FAIL'])
                         if leak_fail and leak_fail.value:
-                            logger.info("Leak Test Failed during Normal run - no DB entry created")
+                            if not leak_logged_normal:
+                                logger.info("Leak Test Failed during Normal run - no DB entry created")
+                                leak_logged_normal = True
                             break
 
                         if rs and rs.value == 0:
@@ -934,7 +989,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
 
                         time.sleep(POLL_INTERVAL)
                 else:
-                    set_pass(plc, False)
+                    # Drive failure handling once; subsequent loops idle while SEQ_STEP==89
                     handle_fail(lh_pass, rh_pass, plc, cursor, lhconv, rhconv)
 
         except KeyboardInterrupt:

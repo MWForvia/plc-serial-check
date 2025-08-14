@@ -128,7 +128,7 @@ PLC_TAGS = {
     # Error & diagnostic
     'TN_DB_ERROR':           'TN.DB_ERROR',
     'DB_ERROR_INFO':         'TN.DB_ERROR_INFO',
-    'TN_MESSAGE':            'TN.Message',
+    'TN_MESSAGE':            'TN.MESSAGE',
 
     # Processing flow
     'FIRST_PIECE_CHECK':     'TN.RABBIT_MODE',
@@ -180,15 +180,64 @@ DB_ERROR_INFO_CODES = {
 }
 # helper to write a message string back to PLC TN.Message tag
 def write_plc_message(plc: LogixDriver, message: str) -> None:
-    """Write a message to the TN.Message PLC tag using .len and .data fields."""
+    """Write a message to the TN.Message PLC tag using pycomm3 string syntax."""
     try:
-        # Ensure the message is within the 200-character limit
-        formatted_message = message[:200]
-        # Write the length and data separately
-        plc.write((PLC_TAGS['TN_MESSAGE'] + '.len', len(formatted_message)))
-        plc.write((PLC_TAGS['TN_MESSAGE'] + '.data', formatted_message))
+        # pycomm3 supports writing STRING tags by passing a Python str directly
+        msg = str(message or "")
+        # TN.Message is defined as STRING[200]; trim to 200 to avoid oversize errors
+        if len(msg) > 200:
+            msg = msg[:200]
+        result = plc.write((PLC_TAGS['TN_MESSAGE'], msg))
+        try:
+            if not result or getattr(result, 'error', None):
+                logger.error("TN.Message write failed: %s | error=%s", msg, getattr(result, 'error', None))
+        except Exception:
+            # tolerate variations in driver return types
+            pass
     except Exception:
         logger.exception("Failed to write PLC message")
+
+
+def self_test_tn_message(plc: LogixDriver) -> None:
+    """Write a short test to TN.Message, verify read-back, then restore previous value."""
+    logger.info("Starting TN.Message self-test")
+    prev_val = ""
+    try:
+        prev = plc.read(PLC_TAGS['TN_MESSAGE'])
+        if prev and getattr(prev, 'error', None) is None:
+            prev_val = prev.value if isinstance(prev.value, str) else ""
+        else:
+            logger.error("TN.Message pre-read failed: error=%s", getattr(prev, 'error', None) if prev else 'None')
+
+        test_msg = f"TNPY900 self-test @ {datetime.now().strftime('%H:%M:%S')}"
+        # direct write to capture result details
+        to_write = test_msg[:200]
+        wr = plc.write((PLC_TAGS['TN_MESSAGE'], to_write))
+        if not wr or getattr(wr, 'error', None):
+            logger.error("TN.Message self-test write failed: error=%s", getattr(wr, 'error', None))
+
+        # brief delay to allow update
+        time.sleep(0.1)
+        rb = plc.read(PLC_TAGS['TN_MESSAGE'])
+        rb_err = getattr(rb, 'error', None) if rb else 'None'
+        rb_val = rb.value if rb and rb_err is None else None
+        logger.debug("TN.Message read-back type=%s value=%r error=%s", type(rb_val).__name__, rb_val, rb_err)
+
+        ok = isinstance(rb_val, str) and rb_val == to_write
+        if ok:
+            logger.info("TN.Message self-test PASS")
+        else:
+            logger.error("TN.Message self-test FAIL: expected=%r got=%r", to_write, rb_val)
+    except Exception:
+        logger.exception("TN.Message self-test encountered an error")
+    finally:
+        try:
+            # restore previous value to avoid leaving test text on HMI
+            wr2 = plc.write((PLC_TAGS['TN_MESSAGE'], prev_val[:200]))
+            if not wr2 or getattr(wr2, 'error', None):
+                logger.error("TN.Message restore write failed: error=%s", getattr(wr2, 'error', None))
+        except Exception:
+            logger.exception("Failed to restore TN.Message after self-test")
 
 # Ensure local DB file exists and has the required schema
 def ensure_db_schema(db_path: str) -> None:
@@ -246,8 +295,8 @@ def ensure_db_schema(db_path: str) -> None:
         except Exception:
             pass
 
-POLL_INTERVAL      = 0.5   # general polling interval
-FAST_POLL_INTERVAL = 0.25   # fast polling for fail/datastore
+POLL_INTERVAL      = 0.8   # general polling interval
+FAST_POLL_INTERVAL = 0.8   # fast polling for fail/datastore
 RETRY_DELAY        = 1    # seconds to wait before first retry
 MAX_RETRY_DELAY    = 5    # maximum seconds to back off on repeated errors
 RESET_BACKOFF_TIMEOUT = 60  # seconds of stability to reset retry delay
@@ -725,6 +774,8 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
         plc._cli.socket.settimeout(None)
         logger.info("PLC connection established.")
         globals()['plc'] = plc
+        # Startup self-test for TN.Message
+        self_test_tn_message(plc)
     except Exception as e:
         logger.error("Initial PLC open failed: %s", e)
     logger.info("Entering monitor_and_update with PLC=%s, DB=%s", plc_ip_address, db_file)

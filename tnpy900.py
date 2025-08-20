@@ -135,6 +135,7 @@ PLC_TAGS = {
     'REWORK_MODE':           'TN.REWORK_MODE',
     'REWORK_LABEL_FINISHED': 'TN.RW_LABEL_FINISHED',
     'TN_MANUAL_ENTRY':       'TN.RW_MANUAL_ENTRY',
+    'PRINT_COMPLETE':        'ZEBRA.Printer.Done',
 
     # TLA duplicate handling
     'TN_TLA_SN_CHECK_PASS':  'TN.TLA_SN_CHECK_PASS',
@@ -657,9 +658,11 @@ def insert_tn_record(db_path: str, timestamp: str, finished_serial: Any,
                     plc.write((PLC_TAGS['DB_ERROR_INFO'], 0))
             except Exception:
                 pass
-            logger.info("Data stored in USB backup database: %s", db_path)
+            label = "USB backup database" if db_path.startswith("/media") else "local database"
+            logger.info("Data stored in %s: %s", label, db_path)
     except Exception as e:
-        logger.error("Failed to write TN record to USB backup DB %s: %s", db_path, e)
+        label = "USB backup DB" if db_path.startswith("/media") else "local DB"
+        logger.error("Failed to write TN record to %s %s: %s", label, db_path, e)
         # set DB error flag and detailed info on failure
         try:
             plc = globals().get('plc')
@@ -673,9 +676,10 @@ def insert_tn_record(db_path: str, timestamp: str, finished_serial: Any,
 def replicate_tn_to_backups(timestamp: str, finished_serial: Any, finished_serial_date: Any,
                             lhconv: Any, lhconv_date: Any, rhconv: Any, rhconv_date: Any, status: str) -> None:
     """
-    Write the same TN record into all database storage locations, with error reporting.
+    Write the same TN record into the USB backup databases only.
+    The local DB is already written by the caller; avoid duplicating it here.
     """
-    for dbp in [default_local_db, USB_DB_BACKUP, USB_DB_BACKUP2]:
+    for dbp in [USB_DB_BACKUP, USB_DB_BACKUP2]:
         try:
             ensure_db_schema(dbp)  # Ensure schema before writing
             insert_tn_record(dbp, timestamp, finished_serial, finished_serial_date, lhconv, lhconv_date, rhconv, rhconv_date, status)
@@ -1011,6 +1015,8 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
 
                 if lh_pass and rh_pass:
                     set_pass(plc, True)
+                    # prevent duplicate inserts while SEQ_STEP remains at 143 and PRINT_COMPLETE stays high
+                    normal_insert_done = False
                     while True:
                         rs = plc.read(PLC_TAGS['SEQ_STEP'])
                         leak_fail = plc.read(PLC_TAGS['LEAK_TEST_FAIL'])
@@ -1026,18 +1032,38 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             break
 
                         if rs and rs.value == 143:
-                            # Perform uniqueness loop and set PLC flag; then insert
+                            # Perform uniqueness loop and set PLC flag; then wait for PRINT_COMPLETE to create DB entry
                             tla_sn = ensure_unique_finished_serial(plc, cursor)
                             if tla_sn:
-                                ts = time.strftime('%Y-%m-%d %H:%M:%S')
-                                cursor.execute(
-                                    SQL_STATEMENTS['insert_tn'],
-                                    (ts, tla_sn, extract_julian(tla_sn), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Passed')
-                                )
-                                conn.commit()
-                                replicate_tn_to_backups(ts, tla_sn, extract_julian(tla_sn), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Passed')                                
-                                logger.info("Database entry created for pass: Serial=%s", tla_sn)
+                                # Wait for print complete (level), or abort on reset/leak-fail
+                                while True:
+                                    rs2 = plc.read(PLC_TAGS['SEQ_STEP'])
+                                    if rs2 and rs2.value == 0:
+                                        logger.info("Cycle Reset.")
+                                        break
+                                    leak2 = plc.read(PLC_TAGS['LEAK_TEST_FAIL'])
+                                    if leak2 and leak2.value:
+                                        if not leak_logged_normal:
+                                            logger.info("Leak Test Failed during Normal run - no DB entry created")
+                                            leak_logged_normal = True
+                                        break
+                                    pc = plc.read(PLC_TAGS['PRINT_COMPLETE'])
+                                    if pc and pc.value:
+                                        ts = time.strftime('%Y-%m-%d %H:%M:%S')
+                                        cursor.execute(
+                                            SQL_STATEMENTS['insert_tn'],
+                                            (ts, tla_sn, extract_julian(tla_sn), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Passed')
+                                        )
+                                        conn.commit()
+                                        replicate_tn_to_backups(ts, tla_sn, extract_julian(tla_sn), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Passed')
+                                        logger.info("Database entry created for pass: Serial=%s", tla_sn)
+                                        normal_insert_done = True
+                                        break
+                                    time.sleep(POLL_INTERVAL)
 
+                        # If we created the record already, exit the outer loop to avoid a second insert
+                        if normal_insert_done:
+                            break
                         time.sleep(POLL_INTERVAL)
                 else:
                     # Drive failure handling once; subsequent loops idle while SEQ_STEP==89

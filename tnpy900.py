@@ -296,8 +296,8 @@ def ensure_db_schema(db_path: str) -> None:
         except Exception:
             pass
 
-POLL_INTERVAL      = 0.8   # general polling interval
-FAST_POLL_INTERVAL = 0.8   # fast polling for fail/datastore
+POLL_INTERVAL      = 0.5   # general polling interval
+FAST_POLL_INTERVAL = 0.25   # fast polling for fail/datastore
 RETRY_DELAY        = 1    # seconds to wait before first retry
 MAX_RETRY_DELAY    = 5    # maximum seconds to back off on repeated errors
 RESET_BACKOFF_TIMEOUT = 60  # seconds of stability to reset retry delay

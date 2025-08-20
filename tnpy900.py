@@ -135,10 +135,11 @@ PLC_TAGS = {
     'REWORK_MODE':           'TN.REWORK_MODE',
     'REWORK_LABEL_FINISHED': 'TN.RW_LABEL_FINISHED',
     'TN_MANUAL_ENTRY':       'TN.RW_MANUAL_ENTRY',
-    'PRINT_COMPLETE':        'ZEBRA.Printer.Done',
 
     # TLA duplicate handling
     'TN_TLA_SN_CHECK_PASS':  'TN.TLA_SN_CHECK_PASS',
+    # DB entry handshake
+    'SERIAL_DB_ENTRY_COMPLETE': 'SERIAL_DB_ENTRY_COMPLETE',
 
     # Existing tags (from the PLC)
     'SERIAL_HOLDER':         'ZEBRA.Working_String[20]',    
@@ -799,6 +800,8 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
     leak_logged_rework = False
     # per-cycle scan consumption flag to avoid reprocessing same SCAN_COMPLETE
     scan_consumed = False
+    # per-cycle flag: track if we've already confirmed a unique TLA and set TN_TLA_SN_CHECK_PASS for this cycle
+    tla_signal_sent = False
     while True:
         cycle_start = time.time()
          # reset back-off after stability
@@ -815,6 +818,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                     plc.write((PLC_TAGS['TN_CHECK_PASS'], False))
                     plc.write((PLC_TAGS['TN_CHECK_FAIL'], False))
                     plc.write((PLC_TAGS['TN_TLA_SN_CHECK_PASS'], False))
+                    plc.write((PLC_TAGS['SERIAL_DB_ENTRY_COMPLETE'], False))
                     plc.write((PLC_TAGS['REWORK_LABEL_FINISHED'], ""))
                     plc.write((PLC_TAGS['TN_MANUAL_ENTRY'], ""))
                     plc.write((PLC_TAGS['TN_MESSAGE'], ""))
@@ -824,6 +828,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                     leak_logged_fpc = False
                     leak_logged_rework = False
                     scan_consumed = False
+                    tla_signal_sent = False
                     continue
                 # If PLC is holding in fail step 89, idle (prevents duplicate logging/inserts)
                 if seq_val == 89:
@@ -871,8 +876,10 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             logger.info("Cycle Reset.")
                             break
                         if rs and rs.value == 143:
-                            # Ensure finished serial is unique; set PLC flag and capture TLA
+                            # Ensure finished serial is unique (function will set TN_TLA_SN_CHECK_PASS True on success)
                             tla_sn = ensure_unique_finished_serial(plc, cursor)
+                            if tla_sn and not tla_signal_sent:
+                                tla_signal_sent = True
                             if tla_sn:
                                 ts = time.strftime('%Y-%m-%d %H:%M:%S')
                                 cursor.execute(SQL_STATEMENTS['insert_tn'],
@@ -1026,40 +1033,29 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                 leak_logged_normal = True
                             break
 
+
                         if rs and rs.value == 0:
                             logger.info("Cycle Reset.")
-                            # Exit loop on reset
                             break
 
                         if rs and rs.value == 143:
-                            # Perform uniqueness loop and set PLC flag; then wait for PRINT_COMPLETE to create DB entry
+                            # Perform uniqueness loop (function will set TN_TLA_SN_CHECK_PASS True on success)
                             tla_sn = ensure_unique_finished_serial(plc, cursor)
-                            if tla_sn:
-                                # Wait for print complete (level), or abort on reset/leak-fail
-                                while True:
-                                    rs2 = plc.read(PLC_TAGS['SEQ_STEP'])
-                                    if rs2 and rs2.value == 0:
-                                        logger.info("Cycle Reset.")
-                                        break
-                                    leak2 = plc.read(PLC_TAGS['LEAK_TEST_FAIL'])
-                                    if leak2 and leak2.value:
-                                        if not leak_logged_normal:
-                                            logger.info("Leak Test Failed during Normal run - no DB entry created")
-                                            leak_logged_normal = True
-                                        break
-                                    pc = plc.read(PLC_TAGS['PRINT_COMPLETE'])
-                                    if pc and pc.value:
-                                        ts = time.strftime('%Y-%m-%d %H:%M:%S')
-                                        cursor.execute(
-                                            SQL_STATEMENTS['insert_tn'],
-                                            (ts, tla_sn, extract_julian(tla_sn), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Passed')
-                                        )
-                                        conn.commit()
-                                        replicate_tn_to_backups(ts, tla_sn, extract_julian(tla_sn), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Passed')
-                                        logger.info("Database entry created for pass: Serial=%s", tla_sn)
-                                        normal_insert_done = True
-                                        break
-                                    time.sleep(POLL_INTERVAL)
+                            if tla_sn and not tla_signal_sent:
+                                tla_signal_sent = True
+                        if rs and rs.value == 160:
+                            ts = time.strftime('%Y-%m-%d %H:%M:%S')
+                            cursor.execute(
+                                SQL_STATEMENTS['insert_tn'],
+                                (ts, tla_sn, extract_julian(tla_sn), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Passed')
+                            )
+                            conn.commit()
+                            replicate_tn_to_backups(ts, tla_sn, extract_julian(tla_sn), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Passed')
+                            logger.info("Database entry created for pass: Serial=%s", tla_sn)
+                            plc.write((PLC_TAGS['SERIAL_DB_ENTRY_COMPLETE'], True))
+                            normal_insert_done = True
+                            break
+                        time.sleep(POLL_INTERVAL)
 
                         # If we created the record already, exit the outer loop to avoid a second insert
                         if normal_insert_done:

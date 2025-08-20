@@ -592,9 +592,11 @@ def ensure_unique_finished_serial(plc: LogixDriver, cursor: sqlite3.Cursor, max_
     On success, sets TN_TLA_SN_CHECK_PASS = True and returns the final unique serial string.
     On failure, returns None.
     """
+    logger.info("Called ensure_unique_finished_serial")
     try:
         for attempt in range(1, max_attempts + 1):
             tla_sn = (plc.read(PLC_TAGS['SERIAL_HOLDER']).value or "").strip()
+            logger.info("Attempt %d: Read SERIAL_HOLDER = %r", attempt, tla_sn)
             if not tla_sn:
                 time.sleep(sleep_s)
                 continue
@@ -604,8 +606,12 @@ def ensure_unique_finished_serial(plc: LogixDriver, cursor: sqlite3.Cursor, max_
                 (date_val, tla_sn)
             )
             dup_count = cursor.fetchone()[0]
+            logger.info("Attempt %d: dup_count = %d", attempt, dup_count)
             if dup_count == 0:
-                plc.write((PLC_TAGS['TN_TLA_SN_CHECK_PASS'], True))
+                logger.info("Setting TN.TLA_SN_CHECK_PASS True")
+                result = plc.write((PLC_TAGS['TN_TLA_SN_CHECK_PASS'], True))
+                if not result or getattr(result, 'error', None):
+                    logger.error("Failed to write TN.TLA_SN_CHECK_PASS: %r", result)
                 logger.info("TLA unique: %s (after %d attempt(s))", tla_sn, attempt)
                 return tla_sn
 
@@ -863,7 +869,8 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                 if fpc_val:
                     logger.info("First Piece Check - test part detected")
                     set_pass(plc, True)
-                    # Poll for reset (0), pass (143), or leak test fail
+                    fpc_tla_sn = None
+                    fpc_insert_done = False
                     while True:
                         rs = plc.read(PLC_TAGS['SEQ_STEP'])
                         leak_fail = plc.read(PLC_TAGS['LEAK_TEST_FAIL'])
@@ -875,24 +882,29 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         if rs and rs.value == 0:
                             logger.info("Cycle Reset.")
                             break
-                        if rs and rs.value == 143:
-                            # Ensure finished serial is unique (function will set TN_TLA_SN_CHECK_PASS True on success)
-                            tla_sn = ensure_unique_finished_serial(plc, cursor)
-                            if tla_sn and not tla_signal_sent:
+                        if rs and rs.value == 143 and not fpc_tla_sn:
+                            logger.info("[FPC] Entered SEQ_STEP 143, calling ensure_unique_finished_serial")
+                            fpc_tla_sn = ensure_unique_finished_serial(plc, cursor)
+                            logger.info("[FPC] ensure_unique_finished_serial returned: %r", fpc_tla_sn)
+                            if fpc_tla_sn and not tla_signal_sent:
                                 tla_signal_sent = True
-                            if tla_sn:
-                                ts = time.strftime('%Y-%m-%d %H:%M:%S')
-                                cursor.execute(SQL_STATEMENTS['insert_tn'],
-                                               (ts,
-                                                tla_sn,
-                                                extract_julian(tla_sn),
-                                                lhconv, extract_julian(lhconv),
-                                                rhconv, extract_julian(rhconv),
-                                                'First Piece Check'))
-                                conn.commit()
-                                logger.info("Data stored in local database (First Piece Check)")
-                                replicate_tn_to_backups(ts, tla_sn, extract_julian(tla_sn), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'First Piece Check')
-                            break
+                        if rs and rs.value == 160 and fpc_tla_sn and not fpc_insert_done:
+                            ts = time.strftime('%Y-%m-%d %H:%M:%S')
+                            cursor.execute(SQL_STATEMENTS['insert_tn'],
+                                           (ts,
+                                            fpc_tla_sn,
+                                            extract_julian(fpc_tla_sn),
+                                            lhconv, extract_julian(lhconv),
+                                            rhconv, extract_julian(rhconv),
+                                            'First Piece Check'))
+                            conn.commit()
+                            replicate_tn_to_backups(ts, fpc_tla_sn, extract_julian(fpc_tla_sn), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'First Piece Check')
+                            logger.info("Data stored in local database (First Piece Check)")
+                            logger.info("Setting SERIAL_DB_ENTRY_COMPLETE True (FPC mode)")
+                            result = plc.write((PLC_TAGS['SERIAL_DB_ENTRY_COMPLETE'], True))
+                            if not result or getattr(result, 'error', None):
+                                logger.error("Failed to write SERIAL_DB_ENTRY_COMPLETE: %r", result)
+                            fpc_insert_done = True
                         time.sleep(POLL_INTERVAL)
                     continue
 
@@ -1039,8 +1051,9 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             break
 
                         if rs and rs.value == 143:
-                            # Perform uniqueness loop (function will set TN_TLA_SN_CHECK_PASS True on success)
+                            logger.info("[Normal] Entered SEQ_STEP 143, calling ensure_unique_finished_serial")
                             tla_sn = ensure_unique_finished_serial(plc, cursor)
+                            logger.info("[Normal] ensure_unique_finished_serial returned: %r", tla_sn)
                             if tla_sn and not tla_signal_sent:
                                 tla_signal_sent = True
                         if rs and rs.value == 160:
@@ -1052,7 +1065,10 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             conn.commit()
                             replicate_tn_to_backups(ts, tla_sn, extract_julian(tla_sn), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Passed')
                             logger.info("Database entry created for pass: Serial=%s", tla_sn)
-                            plc.write((PLC_TAGS['SERIAL_DB_ENTRY_COMPLETE'], True))
+                            logger.info("Setting SERIAL_DB_ENTRY_COMPLETE True")
+                            result = plc.write((PLC_TAGS['SERIAL_DB_ENTRY_COMPLETE'], True))
+                            if not result or getattr(result, 'error', None):
+                                logger.error("Failed to write SERIAL_DB_ENTRY_COMPLETE: %r", result)
                             normal_insert_done = True
                             break
                         time.sleep(POLL_INTERVAL)

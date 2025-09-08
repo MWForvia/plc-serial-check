@@ -174,6 +174,26 @@ def extract_julian(serial: Any) -> str:
     s = str(serial or "")
     return s[2:7] if len(s) >= 7 else ""
 
+def extract_tla_from_barcode(barcode: Any, start_char_1_based: int = 47, length: int = 17) -> Optional[str]:
+    """
+    Extract the TLA serial from a full barcode string.
+    By requirement: take 17 characters starting with character 47 (1-based indexing) of the barcode.
+    Returns None if the barcode is too short.
+    """
+    try:
+        s = str(barcode or "")
+        start_idx = max(0, (start_char_1_based - 1))  # convert to 0-based
+        end_idx = start_idx + max(0, length)
+        if len(s) >= end_idx:
+            tla = s[start_idx:end_idx]
+            logger.info("Extracted TLA from barcode: start=%d length=%d total_len=%d -> %r", start_char_1_based, length, len(s), tla)
+            return tla
+        logger.error("Barcode too short to extract TLA: needed end_idx=%d, got len=%d; barcode=%r", end_idx, len(s), s)
+        return None
+    except Exception:
+        logger.exception("Failed to extract TLA from barcode")
+        return None
+
 # Detailed DB error info codes for TN.DB_ERROR_INFO
 DB_ERROR_INFO_CODES = {
     'SCHEMA_ERROR':        1,  # failed to create or migrate schema
@@ -919,61 +939,51 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         seq = plc.read(PLC_TAGS['SEQ_STEP'])
                         if seq and seq.value == 0:
                             logger.info("Cycle Reset.")
-                            label_fs = None
+                            label_full_barcode = None
+                            tla_fs = None
                             break
                         tag = plc.read(PLC_TAGS['REWORK_LABEL_FINISHED'])
                         if tag and tag.value:
-                            label_fs = tag.value
+                            label_full_barcode = tag.value
+                            logger.info("[Rework] Got full barcode from PLC: %r", label_full_barcode)
+                            tla_fs = extract_tla_from_barcode(label_full_barcode)
                             break
                         time.sleep(POLL_INTERVAL)
                     # timestamp for record
                     ts = time.strftime('%Y-%m-%d %H:%M:%S')
-                    if not label_fs:
+                    if not label_full_barcode:
                         # aborted or no label provided
                         continue
-                    # validate inputs
-                    if not label_fs or not lhconv or not rhconv:
+                    # validate inputs (require extracted TLA and component serials)
+                    if not tla_fs or not lhconv or not rhconv:
                         plc.write((PLC_TAGS['TN_DB_ERROR'], True))
                         plc.write((PLC_TAGS['DB_ERROR_INFO'], DB_ERROR_INFO_CODES['WRITE_ERROR']))
-                        plc.write((PLC_TAGS['DB_ERROR_INFO'], DB_ERROR_INFO_CODES['WRITE_ERROR']))
                         set_pass(plc, False)
-                        logger.error("Rework inputs invalid: FS=%s, LH=%s, RH=%s", label_fs, lhconv, rhconv)
+                        logger.error("Rework inputs invalid: FullBarcode=%s, ExtractedTLA=%s, LH=%s, RH=%s", label_full_barcode, tla_fs, lhconv, rhconv)
                         if wait_for_fail_or_reset(plc):
                             cursor.execute(SQL_STATEMENTS['insert_tn'],
                                            (ts,
-                                            label_fs or 'N/A', extract_julian(label_fs or 'N/A'),
+                                            (tla_fs or 'N/A'), extract_julian(tla_fs or 'N/A'),
                                             lhconv or 'N/A', extract_julian(lhconv or 'N/A'),
                                             rhconv or 'N/A', extract_julian(rhconv or 'N/A'),
                                             'Rework Rerun Fail'))
-                            conn.commit(); replicate_tn_to_backups(ts, label_fs or 'N/A', extract_julian(label_fs or 'N/A'), lhconv or 'N/A', extract_julian(lhconv or 'N/A'), rhconv or 'N/A', extract_julian(rhconv or 'N/A'), 'Rework Rerun Fail')
+                            conn.commit(); replicate_tn_to_backups(ts, (tla_fs or 'N/A'), extract_julian(tla_fs or 'N/A'), lhconv or 'N/A', extract_julian(lhconv or 'N/A'), rhconv or 'N/A', extract_julian(rhconv or 'N/A'), 'Rework Rerun Fail')
                         continue
                     # DB lookup
                     try:
-                        # Use date-index narrowing for each field, then exact value match for consistency and speed
+                        # Require existence of at least one row that matches all three fields (no uniqueness requirement)
                         cursor.execute(
                             "SELECT id FROM tn WHERE finished_serial_date=? AND finished_serial=? "
                             "AND component_serial1_date=? AND component_serial1=? "
                             "AND component_serial2_date=? AND component_serial2=?",
                             (
-                                extract_julian(label_fs), label_fs,
+                                extract_julian(tla_fs), tla_fs,
                                 extract_julian(lhconv), lhconv,
                                 extract_julian(rhconv), rhconv,
                             )
                         )
                         rows = cursor.fetchall()
-                        # Keep existing uniqueness heuristic but make it date-indexed for consistency
-                        cursor.execute(
-                            "SELECT COUNT(*) FROM tn WHERE (finished_serial_date=? AND finished_serial=?) "
-                            "OR (component_serial1_date=? AND component_serial1=?) "
-                            "OR (component_serial2_date=? AND component_serial2=?)",
-                            (
-                                extract_julian(label_fs), label_fs,
-                                extract_julian(lhconv), lhconv,
-                                extract_julian(rhconv), rhconv,
-                            )
-                        )
-                        total = cursor.fetchone()[0]
-                        valid = (len(rows) == 1 and total == 1)
+                        valid = len(rows) >= 1
                     except Exception as e:
                         plc.write((PLC_TAGS['TN_DB_ERROR'], True))
                         plc.write((PLC_TAGS['DB_ERROR_INFO'], DB_ERROR_INFO_CODES['REWORK_LOOKUP_ERROR']))
@@ -982,50 +992,62 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         if wait_for_fail_or_reset(plc):
                             cursor.execute(SQL_STATEMENTS['insert_tn'],
                                            (ts,
-                                            label_fs, extract_julian(label_fs),
+                                            tla_fs or 'N/A', extract_julian(tla_fs or 'N/A'),
                                             lhconv, extract_julian(lhconv),
                                             rhconv, extract_julian(rhconv),
                                             'Rework Rerun Fail'))
-                            conn.commit(); replicate_tn_to_backups(ts, label_fs, extract_julian(label_fs), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Rework Rerun Fail')
+                            conn.commit(); replicate_tn_to_backups(ts, tla_fs or 'N/A', extract_julian(tla_fs or 'N/A'), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Rework Rerun Fail')
                         continue
 
                     # finalize pass/fail
                     if valid:
                         row_id = rows[0][0]
-                        logger.info("Rework Rerun Pass: matched record %s", row_id)
+                        logger.info("Rework Rerun Pass: matched record %s (TLA=%s)", row_id, tla_fs)
                         set_pass(plc, True)
-                        # Rework uses datastore gating; skip DB insert if leak test failed
-                        if wait_for_datastore_or_reset(plc):
+                        # Gate DB insert until label successfully prints at SEQ_STEP 160 (align with Rabbit/FPC)
+                        rework_insert_done = False
+                        while True:
+                            rs = plc.read(PLC_TAGS['SEQ_STEP'])
                             leak_fail = plc.read(PLC_TAGS['LEAK_TEST_FAIL'])
                             if leak_fail and leak_fail.value:
                                 if not leak_logged_rework:
                                     logger.info("Leak Test Failed during Rework - no DB entry created")
                                     leak_logged_rework = True
-                            else:
+                                break
+                            if rs and rs.value == 0:
+                                logger.info("Cycle Reset.")
+                                break
+                            if rs and rs.value == 160 and not rework_insert_done:
                                 cursor.execute(
                                     SQL_STATEMENTS['insert_tn'],
                                     (ts,
-                                     label_fs, extract_julian(label_fs),
+                                     tla_fs, extract_julian(tla_fs),
                                      lhconv, extract_julian(lhconv),
                                      rhconv, extract_julian(rhconv),
                                      'Rework Rerun')
                                 )
                                 conn.commit()
-                                replicate_tn_to_backups(ts, label_fs, extract_julian(label_fs), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Rework Rerun')
+                                replicate_tn_to_backups(ts, tla_fs, extract_julian(tla_fs), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Rework Rerun')
+                                logger.info("Setting SERIAL_DB_ENTRY_COMPLETE True (Rework mode)")
+                                result = plc.write((PLC_TAGS['SERIAL_DB_ENTRY_COMPLETE'], True))
+                                if not result or getattr(result, 'error', None):
+                                    logger.error("Failed to write SERIAL_DB_ENTRY_COMPLETE: %r", result)
+                                rework_insert_done = True
+                            time.sleep(POLL_INTERVAL)
                     else:
-                        logger.error("Rework Rerun Fail: no single matching record for FS=%s, LH=%s, RH=%s", label_fs, lhconv, rhconv)
+                        logger.error("Rework Rerun Fail: no matching record for ExtractedTLA=%s, LH=%s, RH=%s", tla_fs, lhconv, rhconv)
                         set_pass(plc, False)
                         if wait_for_fail_or_reset(plc):
                             cursor.execute(
                                 SQL_STATEMENTS['insert_tn'],
                                 (ts,
-                                 label_fs or 'N/A', extract_julian(label_fs or 'N/A'),
+                                 tla_fs or 'N/A', extract_julian(tla_fs or 'N/A'),
                                  lhconv, extract_julian(lhconv),
                                  rhconv, extract_julian(rhconv),
                                  'Rework Rerun Fail')
                             )
                             conn.commit()
-                            replicate_tn_to_backups(ts, label_fs or 'N/A', extract_julian(label_fs or 'N/A'), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Rework Rerun Fail')
+                            replicate_tn_to_backups(ts, tla_fs or 'N/A', extract_julian(tla_fs or 'N/A'), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Rework Rerun Fail')
                     continue
 
                 # 3) Normal pass / fail

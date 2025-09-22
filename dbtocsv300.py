@@ -31,9 +31,18 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 import traceback  # keep for exception logging
  
-# Helper to detect real mount
+# Helper to detect real mount (walk parents and check mount points)
 def is_mounted(path: str) -> bool:
-    return os.path.ismount(os.path.dirname(path))
+    p = str(path)
+    # if path itself is a mount point, return True
+    if os.path.ismount(p):
+        return True
+    # walk up parents until root
+    while p and p != os.path.sep:
+        if os.path.ismount(p):
+            return True
+        p = os.path.dirname(p)
+    return False
 
 # Configuration
 DB_PATH        = "/home/gap300/tndb300.db"
@@ -41,7 +50,6 @@ CSV_DIR        = "/home/gap300/csv_exports300"
 USB_CSV_DIR    = "/media/usbdrive/csv_exports300"
 USB2_CSV_DIR   = "/media/usbdrive2/csv_exports300"
 DB_BACKUP_DIRS = ["/media/usbdrive/db_backup300", "/media/usbdrive2/db_backup300", "/home/gap300/db_backup300"]
-BACKFILL_DAYS  = 7   # how many past days of CSVs to backfill
 RETRY_DELAY    = 60   # seconds between retry attempts
 
 # directory where rotated logs live
@@ -85,101 +93,52 @@ logger.addHandler(debug_handler)
 
 def export_csv() -> None:
     """
-    Export all rows from 'tn' table to daily CSV files in local and USB directories.
+    Export the entire `tn` table to a dated CSV file and write it to local
+    and mounted USB targets. The CSV filename uses yesterday's date
+    (YYYY-MM-DD.csv) but contains the full table contents each run.
     """
-    # Generate yesterday's CSV locally
     yesterday = datetime.now() - timedelta(days=1)
     filename = yesterday.strftime("%Y-%m-%d") + ".csv"
-    # Read all rows
+
+    # Read full table using the tnpy300 schema
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT id, date, tla1_pn, tla1_tn, tla1_vpps, tla1_duns, "
-                "conv1_pn, conv1_tn, conv1_vpps, conv1_duns, "
-                "tla2_pn, tla2_tn, tla2_vpps, tla2_duns, "
-                "conv2_pn, conv2_tn, conv2_vpps, conv2_duns "
-                "FROM tn"
+                "SELECT id, date, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, status FROM tn"
             )
             rows = cursor.fetchall()
     except Exception:
         logger.exception("export_csv DB read failed")
         return
+
     if not rows:
         logger.debug("No entries to export.")
         return
-    # Write local file
-    local_path = Path(CSV_DIR) / filename
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with open(local_path, mode="w", newline="") as f:
-            writer = csv.writer(f, delimiter="\t")
-            writer.writerow([
-                "id", "date",
-                "tla1_pn", "tla1_tn", "tla1_vpps", "tla1_duns",
-                "conv1_pn", "conv1_tn", "conv1_vpps", "conv1_duns",
-                "tla2_pn", "tla2_tn", "tla2_vpps", "tla2_duns",
-                "conv2_pn", "conv2_tn", "conv2_vpps", "conv2_duns"
-            ])
-            writer.writerows(rows)
-        logger.info(f"CSV file written to {local_path}")
-    except Exception:
-        logger.exception(f"Failed to write CSV to {local_path}")
-    # Helper: detect real mount
-    def is_mounted(path: str) -> bool:
-        return os.path.ismount(os.path.dirname(path))
-    # Backfill all local CSVs to mounted USBs
-    for csv_file in Path(CSV_DIR).glob("*.csv"):
-        for target_dir in (USB_CSV_DIR, USB2_CSV_DIR):
-            if not is_mounted(target_dir):
-                continue
-            dest = Path(target_dir) / csv_file.name
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if not dest.exists():
-                shutil.copy2(str(csv_file), str(dest))
-                logger.info(f"Backfilled {csv_file.name} to {dest}")
-    logger.info(f"Exported {len(rows)} entries to all mounted CSV locations")
 
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            # export the entire table each day using new 17-column schema
-            cursor.execute(
-                "SELECT id, date, tla1_pn, tla1_tn, tla1_vpps, tla1_duns, "
-                "conv1_pn, conv1_tn, conv1_vpps, conv1_duns, "
-                "tla2_pn, tla2_tn, tla2_vpps, tla2_duns, "
-                "conv2_pn, conv2_tn, conv2_vpps, conv2_duns "
-                "FROM tn"
-            )
+    header = [
+        "id", "date",
+        "tla1", "tla1_date", "conv1", "conv1_date",
+        "tla2", "tla2_date", "conv2", "conv2_date",
+        "status",
+    ]
 
-            rows = cursor.fetchall()
-        if not rows:
-            logger.debug("No entries to export.")
-            return
-
-        for target_dir in (CSV_DIR, USB_CSV_DIR, USB2_CSV_DIR):
-            # skip unmounted USB directories
-            if target_dir.startswith("/media") and not is_mounted(target_dir):
-                logger.debug(f"Skipping CSV export to unmounted {target_dir}")
-                continue
-            path = Path(target_dir) / filename
-            path.parent.mkdir(parents=True, exist_ok=True)
+    targets = (CSV_DIR, USB_CSV_DIR, USB2_CSV_DIR)
+    for target_dir in targets:
+        # skip unmounted USB directories
+        if target_dir.startswith("/media") and not is_mounted(target_dir):
+            logger.debug(f"Skipping CSV export to unmounted {target_dir}")
+            continue
+        path = Path(target_dir) / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
             with open(path, mode="w", newline="") as f:
-                writer = csv.writer(f, delimiter="\t")
-                # write header for 17 columns
-                writer.writerow([
-                    "id", "date",
-                    "tla1_pn", "tla1_tn", "tla1_vpps", "tla1_duns",
-                    "conv1_pn", "conv1_tn", "conv1_vpps", "conv1_duns",
-                    "tla2_pn", "tla2_tn", "tla2_vpps", "tla2_duns",
-                    "conv2_pn", "conv2_tn", "conv2_vpps", "conv2_duns"
-                ])
+                writer = csv.writer(f)
+                writer.writerow(header)
                 writer.writerows(rows)
             logger.info(f"CSV file written to {path}")
-
-        logger.info(f"Exported {len(rows)} entries to both CSV locations")
-    except Exception:
-        logger.exception("export_csv failed")
+        except Exception:
+            logger.exception(f"Failed to write CSV to {path}")
 
 
 def backup_db() -> None:
@@ -218,10 +177,9 @@ def backup_db() -> None:
                     "CREATE TABLE IF NOT EXISTS tn ("
                     "id INTEGER PRIMARY KEY AUTOINCREMENT, "
                     "date TEXT, "
-                    "tla1_pn TEXT, tla1_tn TEXT, tla1_vpps TEXT, tla1_duns TEXT, "
-                    "conv1_pn TEXT, conv1_tn TEXT, conv1_vpps TEXT, conv1_duns TEXT, "
-                    "tla2_pn TEXT, tla2_tn TEXT, tla2_vpps TEXT, tla2_duns TEXT, "
-                    "conv2_pn TEXT, conv2_tn TEXT, conv2_vpps TEXT, conv2_duns TEXT"
+                    "tla1 TEXT, tla1_date TEXT, conv1 TEXT, conv1_date TEXT, "
+                    "tla2 TEXT, tla2_date TEXT, conv2 TEXT, conv2_date TEXT, "
+                    "status TEXT"
                     ")"
                 )
                 # Find max ID in backup
@@ -236,14 +194,8 @@ def backup_db() -> None:
                 new_count = cur.fetchone()[0]
                 if new_count > 0:
                     bconn.execute(
-                        "INSERT INTO tn(date, tla1_pn, tla1_tn, tla1_vpps, tla1_duns, "
-                        "conv1_pn, conv1_tn, conv1_vpps, conv1_duns, "
-                        "tla2_pn, tla2_tn, tla2_vpps, tla2_duns, "
-                        "conv2_pn, conv2_tn, conv2_vpps, conv2_duns) "
-                        "SELECT date, tla1_pn, tla1_tn, tla1_vpps, tla1_duns, "
-                        "conv1_pn, conv1_tn, conv1_vpps, conv1_duns, "
-                        "tla2_pn, tla2_tn, tla2_vpps, tla2_duns, "
-                        "conv2_pn, conv2_tn, conv2_vpps, conv2_duns "
+                        "INSERT INTO tn(date, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, status) "
+                        "SELECT date, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, status "
                         "FROM src.tn WHERE id > ?", (max_id,)
                     )
                 bconn.execute("DETACH DATABASE src")

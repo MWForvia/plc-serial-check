@@ -134,37 +134,24 @@ PLC_TAGS = {
     'TN_CHECK_FAIL_LH':      'TN.CHECK_FAIL_LH',
     'TN_CHECK_FAIL_RH':      'TN.CHECK_FAIL_RH',    
     'SCAN_COMPLETE':         'TN.SCAN_COMPLETE',
-
-    # Error & diagnostic
     'TN_DB_ERROR':           'TN.DB_ERROR',
+    'DB_ERROR_INFO':         'TN.DB_ERROR_INFO',
     'TN_MESSAGE':            'TN.MESSAGE',
-
-    # Torque routine
     'TORQUE_PASS':           'TN.TORQUE_PASS',
     'TORQUE_FAIL':           'TN.TORQUE_FAIL',
+    'REWORK_MODE':           'TN.REWORK_MODE',
+    'REWORK_AUTH':           'TN.REWORK_AUTH',
+    'SUPERVISOR_KEY':       'TN.SUPERVISOR_KEY',
 
     # Sequence step (not part of UDT)
     'SEQ_STEP':              'Local_Step_II_N',
-
-    # Serial numbers and data
-    'LH_CONV':               'TN.LH_CONV',
-    'RH_CONV':               'TN.RH_CONV',
-
-    # Rework extensions
-    'ALLOW_MULTIPLE_REWORK': 'TN.ALLOW_MULTIPLE_REWORK',
-
-    # Added PLC_TAGS dictionary to define all PLC tags at the top
-    'HSCAN_GOOD': 'HScan.Good',
-    'REWORK_MODE': 'TN.REWORK_MODE',
-    'REWORK_COUNT': 'TN.REWORK_COUNT',
-    'SUPERVISOR_KEY': 'TN.SUPERVISOR_KEY',
-    'TLA1': 'PN.C2_TLA1_TN',
-    'CONV1': 'PN.C2_CONV1_TN',
-    'TLA2': 'PN.C2_TLA2_TN',
-    'CONV2': 'PN.C2_CONV2_TN'
+    'HSCAN_GOOD':            'HScan.Good',
+    'TLA1':                  'PN.C2_TLA1_TN',
+    'CONV1':                 'PN.C2_CONV1_TN',
+    'TLA2':                  'PN.C2_TLA2_TN',
+    'CONV2':                 'PN.C2_CONV2_TN'
 }
-# Add DB error info tag mapping if PLC supports it
-PLC_TAGS['DB_ERROR_INFO'] = 'TN.DB_ERROR_INFO'
+
 
 # Updated SQL_STATEMENTS to reflect the new schema
 SQL_STATEMENTS = {
@@ -193,9 +180,9 @@ def write_plc_message(plc: LogixDriver, message: str) -> None:
     try:
         # pycomm3 supports writing STRING tags by passing a Python str directly
         msg = str(message or "")
-        # TN.Message is defined as STRING[200]; trim to 200 to avoid oversize errors
-        if len(msg) > 200:
-            msg = msg[:200]
+        # Allen-Bradley STRING limit is 82; use 80 chars safe limit for operator messages
+        if len(msg) > 80:
+            msg = msg[:80]
         # use verified write helper so failures are retried and reported
         ok = safe_write(plc, PLC_TAGS['TN_MESSAGE'], msg, verify=True, retries=3)
         if not ok:
@@ -216,6 +203,22 @@ def safe_write(plc: Optional[LogixDriver], tag_name: str, value: Any, verify: bo
     if plc is None:
         logger.error("safe_write called but plc is None for tag %s", tag_name)
         return False
+
+    # Defensive truncation: if writing to TN.MESSAGE, enforce 80-char limit
+    try:
+        tn_msg_tag = PLC_TAGS.get('TN_MESSAGE')
+    except Exception:
+        tn_msg_tag = None
+    if isinstance(value, str) and tn_msg_tag and (tag_name == tn_msg_tag or tag_name.endswith('.MESSAGE')):
+        if len(value) > 80:
+            value = value[:80]
+
+    # Ensure DB_ERROR_INFO writes are integers
+    try:
+        if tag_name == PLC_TAGS.get('DB_ERROR_INFO'):
+            value = int(value or 0)
+    except Exception:
+        value = 0
 
     for attempt in range(1, retries + 1):
         try:
@@ -703,6 +706,8 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             safe_write(plc, PLC_TAGS['TN_CHECK_FAIL_LH'], False, verify=True, retries=3)
                             safe_write(plc, PLC_TAGS['TN_CHECK_FAIL_RH'], False, verify=True, retries=3)
                             safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], False, verify=True, retries=3)
+                            # Ensure REWORK_AUTH is cleared on cycle reset so PLC HMI isn't left waiting
+                            safe_write(plc, PLC_TAGS['REWORK_AUTH'], False, verify=True, retries=3)
                             write_plc_message(plc, "")
                             scan_consumed = False
                             cycle_reset_done = True
@@ -770,7 +775,8 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         rework_pass_count = cursor.fetchone()[0]
 
                         if rework_pass_count == 0:
-                            # First rework allowed
+                            # First rework allowed — ensure REWORK_AUTH is cleared
+                            safe_write(plc, PLC_TAGS['REWORK_AUTH'], False, verify=True, retries=3)
                             safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], True, verify=True, retries=3)
                             logger.info("Rework gating pass: first rework (prior_reworks=0)")
 
@@ -798,17 +804,23 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             continue
 
                         # Additional reworks require supervisor override
-                        write_plc_message(plc, "Rework Count >0, Supervisor Override Required.")
+                        # Signal to PLC/HMI that supervisor authorization is required
+                        safe_write(plc, PLC_TAGS['REWORK_AUTH'], True, verify=True, retries=3)
+                        write_plc_message(plc, "Rework: Supervisor required")
                         safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], False, verify=True, retries=3)
 
                         # Wait for supervisor or reset
                         while True:
                             if read_tag(plc, PLC_TAGS['SEQ_STEP']) == 10:
+                                # clear REWORK_AUTH on abort/reset so PLC HMI stops prompting
+                                safe_write(plc, PLC_TAGS['REWORK_AUTH'], False, verify=True, retries=3)
                                 write_plc_message(plc, "")
                                 logger.info("Rework override aborted due to cycle reset (SEQ_STEP 10)")
                                 break
                             if read_tag(plc, PLC_TAGS['SUPERVISOR_KEY']):
-                                write_plc_message(plc, "Supervisor Override Accepted.")
+                                # Supervisor accepted — clear auth request and proceed
+                                safe_write(plc, PLC_TAGS['REWORK_AUTH'], False, verify=True, retries=3)
+                                write_plc_message(plc, "Rework: Supervisor accepted")
                                 safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], True, verify=True, retries=3)
                                 logger.info("Supervisor override granted; proceeding with torque gating")
                                 # Torque gating after override

@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """
-tnpy.py
+tnpy300.py
 
-This script pulls the serial numbers scanned from the LH and RH converter and compares them to a historical database.
-It returns if they are a repeat or not, then adds the data to the db.
+Monitor converter/TLA serials from a PLC, check against historical SQLite
+`tn` table and record Pass/Fail/Rework rows. This version includes:
+- Verified PLC writes via `safe_write` (read-after-write, retries).
+- Defensive PLC reads via `read_tag` to tolerate comm failures.
+- USB-safe one-way and tri-directional DB replication to mounted backups.
 
 Database: tndb300.db
 Table: tn
 Schema:
-    id integer primary key autoincrement,
-    date text,
-    tla1 text,
-    tla1_date text,
-    conv1 text,
-    conv1_date text,
-    tla2 text,
-    tla2_date text,
-    conv2 text,
-    conv2_date text,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT,
+    tla1 TEXT,
+    tla1_date TEXT,
+    conv1 TEXT,
+    conv1_date TEXT,
+    tla2 TEXT,
+    tla2_date TEXT,
+    conv2 TEXT,
+    conv2_date TEXT,
     status TEXT
 """
 
@@ -128,7 +131,8 @@ USB_DB_BACKUPS     = [USB_DB_BACKUP, USB_DB_BACKUP2]
 PLC_TAGS = {
     # Control flow
     'TN_CHECK_PASS':         'TN.CHECK_PASS',
-    'TN_CHECK_FAIL':         'TN.CHECK_FAIL',
+    'TN_CHECK_FAIL_LH':      'TN.CHECK_FAIL_LH',
+    'TN_CHECK_FAIL_RH':      'TN.CHECK_FAIL_RH',    
     'SCAN_COMPLETE':         'TN.SCAN_COMPLETE',
 
     # Error & diagnostic
@@ -145,7 +149,6 @@ PLC_TAGS = {
     # Serial numbers and data
     'LH_CONV':               'TN.LH_CONV',
     'RH_CONV':               'TN.RH_CONV',
-    'DATASTORE':             'TN.DATASTORE',
 
     # Rework extensions
     'ALLOW_MULTIPLE_REWORK': 'TN.ALLOW_MULTIPLE_REWORK',
@@ -160,6 +163,8 @@ PLC_TAGS = {
     'TLA2': 'PN.C2_TLA2_TN',
     'CONV2': 'PN.C2_CONV2_TN'
 }
+# Add DB error info tag mapping if PLC supports it
+PLC_TAGS['DB_ERROR_INFO'] = 'TN.DB_ERROR_INFO'
 
 # Updated SQL_STATEMENTS to reflect the new schema
 SQL_STATEMENTS = {
@@ -176,26 +181,6 @@ def extract_julian(serial: Any) -> str:
     s = str(serial or "")
     return s[2:7] if len(s) >= 7 else ""
 
-def extract_tla_from_barcode(barcode: Any, start_char_1_based: int = 47, length: int = 17) -> Optional[str]:
-    """
-    Extract the TLA serial from a full barcode string.
-    By requirement: take 17 characters starting with character 47 (1-based indexing) of the barcode.
-    Returns None if the barcode is too short.
-    """
-    try:
-        s = str(barcode or "")
-        start_idx = max(0, (start_char_1_based - 1))  # convert to 0-based
-        end_idx = start_idx + max(0, length)
-        if len(s) >= end_idx:
-            tla = s[start_idx:end_idx]
-            logger.info("Extracted TLA from barcode: start=%d length=%d total_len=%d -> %r", start_char_1_based, length, len(s), tla)
-            return tla
-        logger.error("Barcode too short to extract TLA: needed end_idx=%d, got len=%d; barcode=%r", end_idx, len(s), s)
-        return None
-    except Exception:
-        logger.exception("Failed to extract TLA from barcode")
-        return None
-
 # Detailed DB error info codes for TN.DB_ERROR_INFO
 DB_ERROR_INFO_CODES = {
     'SCHEMA_ERROR':        1,  # failed to create or migrate schema
@@ -211,62 +196,108 @@ def write_plc_message(plc: LogixDriver, message: str) -> None:
         # TN.Message is defined as STRING[200]; trim to 200 to avoid oversize errors
         if len(msg) > 200:
             msg = msg[:200]
-        result = plc.write((PLC_TAGS['TN_MESSAGE'], msg))
-        try:
-            if not result or getattr(result, 'error', None):
-                logger.error("TN.Message write failed: %s | error=%s", msg, getattr(result, 'error', None))
-        except Exception:
-            # tolerate variations in driver return types
-            pass
+        # use verified write helper so failures are retried and reported
+        ok = safe_write(plc, PLC_TAGS['TN_MESSAGE'], msg, verify=True, retries=3)
+        if not ok:
+            logger.error("TN.Message write failed after retries: %s", msg)
     except Exception:
         logger.exception("Failed to write PLC message")
 
 
-def self_test_tn_message(plc: LogixDriver) -> None:
-    """Write a short test to TN.Message, verify read-back, then restore previous value."""
-    logger.info("Starting TN.Message self-test")
-    prev_val = ""
-    try:
-        prev = plc.read(PLC_TAGS['TN_MESSAGE'])
-        if prev and getattr(prev, 'error', None) is None:
-            prev_val = prev.value if isinstance(prev.value, str) else ""
-        else:
-            logger.error("TN.Message pre-read failed: error=%s", getattr(prev, 'error', None) if prev else 'None')
-
-        test_msg = f"TNPY300 self-test @ {datetime.now().strftime('%H:%M:%S')}"
-        # direct write to capture result details
-        to_write = test_msg[:200]
-        wr = plc.write((PLC_TAGS['TN_MESSAGE'], to_write))
-        if not wr or getattr(wr, 'error', None):
-            logger.error("TN.Message self-test write failed: error=%s", getattr(wr, 'error', None))
-
-        # brief delay to allow update
-        time.sleep(0.1)
-        rb = plc.read(PLC_TAGS['TN_MESSAGE'])
-        rb_err = getattr(rb, 'error', None) if rb else 'None'
-        rb_val = rb.value if rb and rb_err is None else None
-        logger.debug("TN.Message read-back type=%s value=%r error=%s", type(rb_val).__name__, rb_val, rb_err)
-
-        ok = isinstance(rb_val, str) and rb_val == to_write
-        if ok:
-            logger.info("TN.Message self-test PASS")
-        else:
-            logger.error("TN.Message self-test FAIL: expected=%r got=%r", to_write, rb_val)
-    except Exception:
-        logger.exception("TN.Message self-test encountered an error")
-    finally:
-        try:
-            # restore previous value to avoid leaving test text on HMI
-            wr2 = plc.write((PLC_TAGS['TN_MESSAGE'], prev_val[:200]))
-            if not wr2 or getattr(wr2, 'error', None):
-                logger.error("TN.Message restore write failed: error=%s", getattr(wr2, 'error', None))
-        except Exception:
-            logger.exception("Failed to restore TN.Message after self-test")
-
-# Ensure local DB file exists and has the required schema
-def ensure_db_schema(db_path: str) -> None:
+def safe_write(plc: Optional[LogixDriver], tag_name: str, value: Any, verify: bool = True, retries: int = 3) -> bool:
     """
-    Ensure the database file exists and has the required schema, with error reporting.
+    Perform a write to the PLC and verify by reading the tag back.
+    - Attempts up to `retries` times (including initial attempt).
+    - If verification is enabled, reads the tag after write and compares values.
+    - On persistent failure, sets TN.DB_ERROR True (best-effort) and returns False.
+    Returns True on confirmed success, False otherwise.
+    """
+    import time, random
+    if plc is None:
+        logger.error("safe_write called but plc is None for tag %s", tag_name)
+        return False
+
+    for attempt in range(1, retries + 1):
+        try:
+            result = plc.write((tag_name, value))
+        except Exception as exc:
+            logger.warning("PLC write exception for %s attempt %d/%d: %s", tag_name, attempt, retries, exc)
+            result = None
+
+        ok = True
+        # Quick heuristic checks on driver return types
+        if result is False or result is None:
+            ok = False
+        else:
+            try:
+                # some drivers return objects with 'status'/'error' or truthy success
+                if getattr(result, 'error', None):
+                    ok = False
+            except Exception:
+                pass
+
+        if ok and verify:
+            # Read-back verification
+            try:
+                read_obj = plc.read(tag_name)
+                read_val = getattr(read_obj, 'value', read_obj)
+                # Normalise bytes/str differences
+                if isinstance(value, bytes) and isinstance(read_val, (bytes, bytearray)):
+                    read_cmp = bytes(read_val)
+                else:
+                    read_cmp = read_val
+                if read_cmp != value:
+                    logger.warning("Read-back mismatch for %s: wrote=%r read=%r (attempt %d/%d)", tag_name, value, read_val, attempt, retries)
+                    ok = False
+            except Exception as exc:
+                logger.warning("Read-back exception for %s attempt %d/%d: %s", tag_name, attempt, retries, exc)
+                ok = False
+
+        if ok:
+            if attempt > 1:
+                logger.info("PLC write succeeded for %s after %d attempts", tag_name, attempt)
+            return True
+
+        # backoff before retry
+        if attempt < retries:
+            delay = min(0.1 * (2 ** (attempt - 1)), 2.0) + random.uniform(0, 0.05)
+            time.sleep(delay)
+
+    # All retries exhausted — mark DB error flag (best-effort)
+    logger.error("PLC write failed for %s after %d attempts; setting TN.DB_ERROR", tag_name, retries)
+    try:
+        # try best-effort write to TN.DB_ERROR without recursion
+        plc.write((PLC_TAGS['TN_DB_ERROR'], True))
+    except Exception:
+        logger.exception("Failed to set TN.DB_ERROR after write failures")
+    return False
+
+
+def read_tag(plc: Optional[LogixDriver], tag_name: str) -> Any:
+    """Safely read a PLC tag and return the tag value or None on error.
+
+    - Returns the attribute `value` when present on the driver response,
+      otherwise returns the raw driver result.
+    - Returns None on exceptions or when the driver returns None.
+    """
+    if plc is None:
+        return None
+    try:
+        res = plc.read(tag_name)
+    except Exception:
+        logger.debug("PLC read exception for %s", tag_name, exc_info=True)
+        return None
+    if res is None:
+        return None
+    # If driver returned an object with 'value' attribute, use it, otherwise return the object itself
+    return getattr(res, 'value', res)
+
+
+def ensure_db_schema(db_path: str) -> None:
+    """Ensure the database file exists and has the required `tn` table and indexes.
+
+    This function is idempotent and safe to call multiple times for local and
+    USB backup DB paths.
     """
     parent = os.path.dirname(db_path) or '.'
     try:
@@ -306,13 +337,13 @@ def ensure_db_schema(db_path: str) -> None:
         try:
             plc = globals().get('plc')
             if plc:
-                plc.write((PLC_TAGS['TN_DB_ERROR'], True))
-                plc.write((PLC_TAGS['DB_ERROR_INFO'], DB_ERROR_INFO_CODES['SCHEMA_ERROR']))
+                safe_write(plc, PLC_TAGS['TN_DB_ERROR'], True, verify=True, retries=3)
+                safe_write(plc, PLC_TAGS['DB_ERROR_INFO'], DB_ERROR_INFO_CODES['SCHEMA_ERROR'], verify=True, retries=3)
         except Exception:
             pass
 
 POLL_INTERVAL      = 0.5   # general polling interval
-FAST_POLL_INTERVAL = 0.25   # fast polling for fail/datastore
+FAST_POLL_INTERVAL = 0.25   # fast polling for fail
 RETRY_DELAY        = 1    # seconds to wait before first retry
 MAX_RETRY_DELAY    = 5    # maximum seconds to back off on repeated errors
 RESET_BACKOFF_TIMEOUT = 60  # seconds of stability to reset retry delay
@@ -382,14 +413,11 @@ def sync_db_from_backup(local_db: str) -> None:
                             """
                         )
                         init_conn.commit()
-                        # create indexes on new backup DB
-                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished ON tn(finished_serial);")
-                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished_date ON tn(finished_serial_date);")
-                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished_date_serial ON tn(finished_serial_date, finished_serial);")
-                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component1_date ON tn(component_serial1_date);")
-                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component1_date_serial ON tn(component_serial1_date, component_serial1);")
-                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component2_date ON tn(component_serial2_date);")
-                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component2_date_serial ON tn(component_serial2_date, component_serial2);")
+                        # create indexes on new backup DB (match current schema)
+                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_tla1_date ON tn(tla1_date);")
+                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_conv1_date ON tn(conv1_date);")
+                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_tla2_date ON tn(tla2_date);")
+                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_conv2_date ON tn(conv2_date);")
                         init_conn.commit()
                         logger.debug("Created and initialized new backup DB at %s", path)
                 except Exception:
@@ -434,9 +462,8 @@ def sync_db_from_backup(local_db: str) -> None:
                 tgt_cur.execute(
                     "CREATE TABLE IF NOT EXISTS tn ("
                     "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                    "date TEXT, finished_serial TEXT, finished_serial_date TEXT, "
-                    "component_serial1 TEXT, component_serial1_date TEXT, "
-                    "component_serial2 TEXT, component_serial2_date TEXT, status TEXT)"
+                    "date TEXT, tla1 TEXT, tla1_date TEXT, conv1 TEXT, conv1_date TEXT, "
+                    "tla2 TEXT, tla2_date TEXT, conv2 TEXT, conv2_date TEXT, status TEXT)"
                 )
                 tgt_cur.execute("SELECT MAX(id) FROM tn")
                 max_id = tgt_cur.fetchone()[0] or 0
@@ -446,10 +473,8 @@ def sync_db_from_backup(local_db: str) -> None:
                 ).fetchone()[0]
                 if new_count > 0:
                     tgt_conn.execute(
-                        "INSERT INTO tn(date, finished_serial, finished_serial_date, component_serial1, component_serial1_date, "
-                        "component_serial2, component_serial2_date, status) "
-                        "SELECT date, finished_serial, finished_serial_date, component_serial1, component_serial1_date, "
-                        "component_serial2, component_serial2_date, status "
+                        "INSERT INTO tn(date, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, status) "
+                        "SELECT date, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, status "
                         "FROM src.tn WHERE id > ?", (max_id,)
                     )
                     tgt_conn.commit()
@@ -479,24 +504,24 @@ def sync_local_to_target(local_db: str, target_db: str) -> None:
                     CREATE TABLE IF NOT EXISTS tn (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         date TEXT,
-                        finished_serial TEXT,
-                        finished_serial_date TEXT,
-                        component_serial1 TEXT,
-                        component_serial1_date TEXT,
-                        component_serial2 TEXT,
-                        component_serial2_date TEXT,
+                        tla1 TEXT,
+                        tla1_date TEXT,
+                        conv1 TEXT,
+                        conv1_date TEXT,
+                        tla2 TEXT,
+                        tla2_date TEXT,
+                        conv2 TEXT,
+                        conv2_date TEXT,
                         status TEXT
                     )
                     """
                 )
                 init_conn.commit()
-                # Ensure indexes used by lookups exist on fresh targets
-                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished_date ON tn(finished_serial_date);")
-                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished_date_serial ON tn(finished_serial_date, finished_serial);")
-                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component1_date ON tn(component_serial1_date);")
-                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component1_date_serial ON tn(component_serial1_date, component_serial1);")
-                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component2_date ON tn(component_serial2_date);")
-                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component2_date_serial ON tn(component_serial2_date, component_serial2);")
+                # Ensure indexes used by lookups exist on fresh targets (match current schema)
+                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_tla1_date ON tn(tla1_date);")
+                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_conv1_date ON tn(conv1_date);")
+                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_tla2_date ON tn(tla2_date);")
+                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_conv2_date ON tn(conv2_date);")
                 init_conn.commit()
             logger.debug("Initialized target DB for one-way sync at %s", target_db)
         except Exception:
@@ -512,10 +537,8 @@ def sync_local_to_target(local_db: str, target_db: str) -> None:
             ).fetchone()[0]
             if new_count > 0:
                 tgt_conn.execute(
-                    "INSERT INTO tn(date, finished_serial, finished_serial_date, component_serial1, component_serial1_date, "
-                    "component_serial2, component_serial2_date, status) "
-                    "SELECT date, finished_serial, finished_serial_date, component_serial1, component_serial1_date, "
-                    "component_serial2, component_serial2_date, status "
+                    "INSERT INTO tn(date, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, status) "
+                    "SELECT date, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, status "
                     "FROM src.tn WHERE id > ?", (max_id,)
                 )
                 tgt_conn.commit()
@@ -542,25 +565,10 @@ def watch_usb_and_sync(local_db: str, usb_path: str, name: str) -> None:
 def wait_for_tag(plc: LogixDriver, tag_key: str) -> None:
     name = PLC_TAGS[tag_key]
     while True:
-        val = plc.read(name)
-        if val and val.value:
+        val = read_tag(plc, name)
+        if val:
             return  # Proceed immediately if the tag is already true
         time.sleep(POLL_INTERVAL)
-
-
-def wait_for_datastore_or_reset(plc: LogixDriver) -> bool:
-    """
-    Check if DATASTORE is already true or wait for it, exit on reset.
-    """
-    while True:
-        rs = plc.read(PLC_TAGS['SEQ_STEP'])
-        if rs and rs.value == 0:
-            logger.info("Cycle Reset.")
-            return False  # Exit on reset
-        ds = plc.read(PLC_TAGS['DATASTORE'])
-        if ds and ds.value:
-            return True  # Proceed if DATASTORE is already true
-        time.sleep(FAST_POLL_INTERVAL)
 
 
 def wait_for_fail_or_reset(plc: LogixDriver) -> bool:
@@ -568,13 +576,10 @@ def wait_for_fail_or_reset(plc: LogixDriver) -> bool:
     Level-detect the PART_FAIL tag: return True as soon as it's observed true, or exit on reset.
     """
     while True:
-        rs = plc.read(PLC_TAGS['SEQ_STEP'])
-        if rs and rs.value == 0:
+        rs = read_tag(plc, PLC_TAGS['SEQ_STEP'])
+        if rs == 10:
             logger.info("Cycle Reset.")
             return False
-        fl = plc.read(PLC_TAGS['PART_FAIL'])
-        if fl and fl.value:
-            return True
         time.sleep(FAST_POLL_INTERVAL)
 
 
@@ -595,56 +600,12 @@ def check_converter_sn(cursor: sqlite3.Cursor, column: str, sn: Any, label: str)
 
 
 def set_pass(plc: LogixDriver, passed: bool) -> None:
-    plc.write((PLC_TAGS['TN_CHECK_PASS'], passed))
-    plc.write((PLC_TAGS['TN_CHECK_FAIL'], not passed))
-
-
-def ensure_unique_finished_serial(plc: LogixDriver, cursor: sqlite3.Cursor, max_attempts: int = 1000, sleep_s: float = 0.1) -> Optional[str]:
-    """
-    At SEQ_STEP == 143, verify finished_serial from SERIAL_HOLDER is unique by
-    (finished_serial_date, finished_serial). If duplicate, increment SERIAL_NUMBER[PART_SELECT]
-    and retry until unique or max_attempts reached.
-
-    On success, sets TN_TLA_SN_CHECK_PASS = True and returns the final unique serial string.
-    On failure, returns None.
-    """
-    logger.info("Called ensure_unique_finished_serial")
-    try:
-        for attempt in range(1, max_attempts + 1):
-            tla_sn = (plc.read(PLC_TAGS['SERIAL_HOLDER']).value or "").strip()
-            logger.info("Attempt %d: Read SERIAL_HOLDER = %r", attempt, tla_sn)
-            if not tla_sn:
-                time.sleep(sleep_s)
-                continue
-            date_val = extract_julian(tla_sn)
-            cursor.execute(
-                "SELECT COUNT(*) FROM tn WHERE finished_serial_date = ? AND finished_serial = ?",
-                (date_val, tla_sn)
-            )
-            dup_count = cursor.fetchone()[0]
-            logger.info("Attempt %d: dup_count = %d", attempt, dup_count)
-            if dup_count == 0:
-                logger.info("Setting TN.TLA_SN_CHECK_PASS True")
-                result = plc.write((PLC_TAGS['TN_TLA_SN_CHECK_PASS'], True))
-                if not result or getattr(result, 'error', None):
-                    logger.error("Failed to write TN.TLA_SN_CHECK_PASS: %r", result)
-                logger.info("TLA unique: %s (after %d attempt(s))", tla_sn, attempt)
-                return tla_sn
-
-            # Duplicate, increment PLC serial number for current part selection
-            part_select = plc.read(PLC_TAGS['PART_SELECT']).value or 0
-            current_sn_num = plc.read(f"{PLC_TAGS['SERIAL_NUMBER']}[{part_select}]").value or 0
-            next_sn_num = current_sn_num + 1
-            plc.write((f"{PLC_TAGS['SERIAL_NUMBER']}[{part_select}]", next_sn_num))
-            logger.info("TLA duplicate detected for %s; incremented SERIAL_NUMBER[%s] to %s (attempt %d)",
-                        tla_sn, part_select, next_sn_num, attempt)
-            time.sleep(sleep_s)
-
-        logger.error("Failed to resolve TLA duplicate within %d attempts", max_attempts)
-        return None
-    except Exception:
-        logger.exception("Error during TLA uniqueness resolution loop")
-        return None
+    # Set PASS and per-side FAIL flags consistently
+    safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], passed, verify=True, retries=3)
+    # When passing, clear both fail flags; when failing, leave per-side flags to callers
+    if passed:
+        safe_write(plc, PLC_TAGS['TN_CHECK_FAIL_LH'], False, verify=True, retries=3)
+        safe_write(plc, PLC_TAGS['TN_CHECK_FAIL_RH'], False, verify=True, retries=3)
 
 
 def insert_tn_record(db_path: str, timestamp: str, tla1: Any, tla1_date: Any, conv1: Any, conv1_date: Any, tla2: Any, tla2_date: Any, conv2: Any, conv2_date: Any, status: str) -> None:
@@ -675,8 +636,8 @@ def insert_tn_record(db_path: str, timestamp: str, tla1: Any, tla1_date: Any, co
             try:
                 plc = globals().get('plc')
                 if plc:
-                    plc.write((PLC_TAGS['TN_DB_ERROR'], False))
-                    plc.write((PLC_TAGS['DB_ERROR_INFO'], 0))
+                    safe_write(plc, PLC_TAGS['TN_DB_ERROR'], False, verify=True, retries=3)
+                    safe_write(plc, PLC_TAGS['DB_ERROR_INFO'], 0, verify=True, retries=3)
             except Exception:
                 pass
             label = "USB backup database" if db_path.startswith("/media") else "local database"
@@ -688,211 +649,298 @@ def insert_tn_record(db_path: str, timestamp: str, tla1: Any, tla1_date: Any, co
         try:
             plc = globals().get('plc')
             if plc:
-                plc.write((PLC_TAGS['TN_DB_ERROR'], True))
-                plc.write((PLC_TAGS['DB_ERROR_INFO'], DB_ERROR_INFO_CODES['WRITE_ERROR']))
+                safe_write(plc, PLC_TAGS['TN_DB_ERROR'], True, verify=True, retries=3)
+                safe_write(plc, PLC_TAGS['DB_ERROR_INFO'], DB_ERROR_INFO_CODES['WRITE_ERROR'], verify=True, retries=3)
         except Exception:
             pass
 
 
-def replicate_tn_to_backups(timestamp: str, finished_serial: Any, finished_serial_date: Any,
-                            lhconv: Any, lhconv_date: Any, rhconv: Any, rhconv_date: Any, status: str) -> None:
-    """
-    Write the same TN record into the USB backup databases only.
-    The local DB is already written by the caller; avoid duplicating it here.
-    """
-    for dbp in [USB_DB_BACKUP, USB_DB_BACKUP2]:
+# Updated replication helper to match current tn schema (tla1/conv1/tla2/conv2)
+def replicate_tn_to_backups(timestamp: str,
+                            tla1: Any, tla1_date: Any,
+                            conv1: Any, conv1_date: Any,
+                            tla2: Any, tla2_date: Any,
+                            conv2: Any, conv2_date: Any,
+                            status: str) -> None:
+    """Replicate a tn row to mounted USB backup databases (non-fatal if absent)."""
+    for dbp in USB_DB_BACKUPS:
+        if not dbp.startswith('/media'):
+            continue
+        # Skip silently if device/mount not present
+        mount_root = os.path.dirname(os.path.dirname(dbp))
+        if not is_mounted(mount_root):
+            logger.debug("Skip replicate: mount not present for %s", dbp)
+            continue
         try:
-            ensure_db_schema(dbp)  # Ensure schema before writing
-            insert_tn_record(dbp, timestamp, finished_serial, finished_serial_date, lhconv, lhconv_date, rhconv, rhconv_date, status)
-        except Exception as e:
-            logger.error("Failed to replicate TN record to %s: %s", dbp, e)
-            # Report write error to PLC
-            try:
-                plc = globals().get('plc')
-                if plc:
-                    plc.write((PLC_TAGS['TN_DB_ERROR'], True))
-                    plc.write((PLC_TAGS['DB_ERROR_INFO'], DB_ERROR_INFO_CODES['WRITE_ERROR']))
-            except Exception:
-                pass
-
-
-def record_and_signal_failure(plc: LogixDriver, cursor: sqlite3.Cursor,
-                              finished_serial: Any, lhconv: Any, rhconv: Any,
-                              status: str) -> None:
-    """
-    Log and write a single failure entry, then drive PLC to fail step (29).
-    This is gated by SEQ_STEP != 29 to prevent repeats; level-trigger only.
-    """
-    try:
-        seq = plc.read(PLC_TAGS['SEQ_STEP'])
-        if seq and seq.value == 29:
-            return  # Already in fail step; do nothing
-
-        ts = time.strftime('%Y-%m-%d %H:%M:%S')
-        fs = finished_serial or 'N/A'
-        fs_date = extract_julian(fs)
-        lh = lhconv or 'N/A'
-        rh = rhconv or 'N/A'
-        cursor.execute(
-            SQL_STATEMENTS['insert_tn'],
-            (ts, fs, fs_date, lh, extract_julian(lh), rh, extract_julian(rh), status)
-        )
-        cursor.connection.commit()
-        replicate_tn_to_backups(ts, fs, fs_date, lh, extract_julian(lh), rh, extract_julian(rh), status)
-        logger.error("Failed TN Check - Data stored in database")
-        write_plc_message(plc, status)
-        # Set PLC fail flags and step
-        try:
-            plc.write((PLC_TAGS['TN_CHECK_PASS'], False))
-            plc.write((PLC_TAGS['TN_CHECK_FAIL'], True))
-            plc.write((PLC_TAGS['SEQ_STEP'], 29))
+            ensure_db_schema(dbp)
+            insert_tn_record(dbp, timestamp, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, status)
         except Exception:
-            logger.exception("Failed to write PLC fail flags/step")
-    except Exception:
-        logger.exception("Failure record/signaling encountered an error")
+            logger.exception("Replication to %s failed (non-fatal)", dbp)
 
-
-def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
-                cursor: sqlite3.Cursor, lhconv: Any, rhconv: Any) -> None:
-    # Leak-test failures are no longer recorded in the DB; duplicates still are handled
-    try:
-        seq = plc.read(PLC_TAGS['SEQ_STEP'])
-        if seq and seq.value == 29:
-            return  # already handled this cycle
-
-        if not lh_pass and not rh_pass:
-            base_status = "LH & RH TN Duplicate - Failed"
-            cursor.execute(
-                "SELECT finished_serial FROM tn WHERE (component_serial1_date = ? AND component_serial1 = ?) OR (component_serial2_date = ? AND component_serial2 = ?) ORDER BY id ASC LIMIT 1",
-                (extract_julian(lhconv), lhconv, extract_julian(rhconv), rhconv)
-            )
-        elif not lh_pass:
-            base_status = "LH TN Duplicate - Failed"
-            cursor.execute(
-                "SELECT finished_serial FROM tn WHERE component_serial1_date = ? AND component_serial1 = ? ORDER BY id ASC LIMIT 1",
-                (extract_julian(lhconv), lhconv)
-            )
-        else:
-            base_status = "RH TN Duplicate - Failed"
-            cursor.execute(
-                "SELECT finished_serial FROM tn WHERE component_serial2_date = ? AND component_serial2 = ? ORDER BY id ASC LIMIT 1",
-                (extract_julian(rhconv), rhconv)
-            )
-
-        row = cursor.fetchone()
-        first_tla = row[0] if row and row[0] else "Unknown"
-        status = f"{base_status} (first TLA: {first_tla})"
-        # Record once, then drive PLC to step 29
-        record_and_signal_failure(plc, cursor, 'N/A', lhconv, rhconv, status)
-    except Exception:
-        logger.exception("handle_fail encountered an error")
-
-
-# Reintroduced timeout configuration and logging for PLC connection
 
 def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
-    """
-    Monitor PLC and update the database with relevant data.
-    """
+    """Main monitoring loop with Normal + Rework mode gating."""
     try:
         with LogixDriver(plc_ip_address) as plc:
-            plc._cli.socket.settimeout(None)
+            # ensure non-blocking socket behavior similar to prior code
+            try:
+                plc._cli.socket.settimeout(None)
+            except Exception:
+                pass
             logger.info("PLC connection established.")
-
             ensure_db_schema(db_file)
             conn = get_db_connection(db_file)
             cursor = conn.cursor()
+            scan_consumed = False
+            cycle_reset_done = False  # debounce flag for SEQ_STEP 10 reset handling
 
-            logger.info("Starting monitor_and_update loop")
             while True:
                 try:
-                    hscan_good = plc.read(PLC_TAGS['HSCAN_GOOD']).value
-                    if not hscan_good:
+                    # Cycle reset handling
+                    seq_val = read_tag(plc, PLC_TAGS['SEQ_STEP'])
+                    if seq_val == 10:
+                        if not cycle_reset_done:
+                            safe_write(plc, PLC_TAGS['TN_CHECK_FAIL_LH'], False, verify=True, retries=3)
+                            safe_write(plc, PLC_TAGS['TN_CHECK_FAIL_RH'], False, verify=True, retries=3)
+                            safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], False, verify=True, retries=3)
+                            write_plc_message(plc, "")
+                            scan_consumed = False
+                            cycle_reset_done = True
+                    else:
+                        cycle_reset_done = False
+
+                    # Detect mode and scan completeness
+                    rework_mode = bool(read_tag(plc, PLC_TAGS['REWORK_MODE']))
+                    scan_complete = bool(read_tag(plc, PLC_TAGS['SCAN_COMPLETE']))
+                    if not scan_complete:
+                        scan_consumed = False
                         time.sleep(POLL_INTERVAL)
                         continue
+                    if scan_consumed:
+                        time.sleep(POLL_INTERVAL)
+                        continue
+                    scan_consumed = True
 
-                    rework_mode = plc.read(PLC_TAGS['REWORK_MODE']).value
-                    tla1 = plc.read(PLC_TAGS['TLA1']).value
-                    conv1 = plc.read(PLC_TAGS['CONV1']).value
-                    tla2 = plc.read(PLC_TAGS['TLA2']).value
-                    conv2 = plc.read(PLC_TAGS['CONV2']).value
-
+                    # Read serials safely
+                    tla1 = (read_tag(plc, PLC_TAGS['TLA1']) or '').strip()
+                    conv1 = (read_tag(plc, PLC_TAGS['CONV1']) or '').strip()
+                    tla2 = (read_tag(plc, PLC_TAGS['TLA2']) or '').strip()
+                    conv2 = (read_tag(plc, PLC_TAGS['CONV2']) or '').strip()
                     tla1_date = extract_julian(tla1)
                     conv1_date = extract_julian(conv1)
                     tla2_date = extract_julian(tla2)
                     conv2_date = extract_julian(conv2)
+                    ts = time.strftime('%Y-%m-%d %H:%M:%S')
 
                     if rework_mode:
-                        rework_count = plc.read(PLC_TAGS['REWORK_COUNT']).value
-                        supervisor_key = plc.read(PLC_TAGS['SUPERVISOR_KEY']).value
-
+                        # Rework gating
                         cursor.execute(
-                            "SELECT COUNT(*) FROM tn WHERE tla1_date = ? AND tla1 = ? AND conv1_date = ? AND conv1 = ? AND tla2_date = ? AND tla2 = ? AND conv2_date = ? AND conv2 = ?",
-                            (tla1_date, tla1, conv1_date, conv1, tla2_date, tla2, conv2_date, conv2)
-                        )
-                        exact_match_count = cursor.fetchone()[0]
-
-                        cursor.execute(
-                            "SELECT COUNT(*) FROM tn WHERE tla1 = ? OR conv1 = ? OR tla2 = ? OR conv2 = ?",
+                            "SELECT id FROM tn WHERE tla1=? AND conv1=? AND tla2=? AND conv2=? AND status='Passed' LIMIT 2",
                             (tla1, conv1, tla2, conv2)
                         )
-                        partial_match_count = cursor.fetchone()[0]
+                        rows = cursor.fetchall()
+                        if len(rows) != 1:
+                            logger.warning("Rework gate fail: expected 1 base pass row, found %d", len(rows))
+                            safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], False, verify=True, retries=3)
+                            continue
+                        base_id = rows[0][0]
 
-                        if exact_match_count == 1 and partial_match_count == 1:
-                            if rework_count == 0 or (rework_count > 0 and supervisor_key):
-                                plc.write((PLC_TAGS['TN_CHECK_PASS'], True))
-                                logger.info("Rework mode: Serial numbers match a single record. Marking as pass.")
-                            else:
-                                plc.write((PLC_TAGS['TN_CHECK_FAIL'], True))
-                                logger.error("Rework mode: Supervisor key required for rework.")
-                        else:
-                            plc.write((PLC_TAGS['TN_CHECK_FAIL'], True))
-                            logger.error("Rework mode: Serial numbers do not match a single record.")
-                    else:
-                        cursor.execute("SELECT 1 FROM tn WHERE tla1_date = ? AND tla1 = ?", (tla1_date, tla1))
-                        tla1_exists = cursor.fetchone() is not None
-
-                        cursor.execute("SELECT 1 FROM tn WHERE conv1_date = ? AND conv1 = ?", (conv1_date, conv1))
-                        conv1_exists = cursor.fetchone() is not None
-
-                        cursor.execute("SELECT 1 FROM tn WHERE tla2_date = ? AND tla2 = ?", (tla2_date, tla2))
-                        tla2_exists = cursor.fetchone() is not None
-
-                        cursor.execute("SELECT 1 FROM tn WHERE conv2_date = ? AND conv2 = ?", (conv2_date, conv2))
-                        conv2_exists = cursor.fetchone() is not None
-
-                        if not (tla1_exists or conv1_exists or tla2_exists or conv2_exists):
-                            plc.write((PLC_TAGS['TN_CHECK_PASS'], True))
-                            logger.info("All serial numbers are unique. Marking as pass.")
+                        # Ensure uniqueness of serials to base row
+                        unique_ok = True
+                        for s in (tla1, conv1, tla2, conv2):
+                            if not s:
+                                unique_ok = False
+                                break
                             cursor.execute(
-                                "INSERT INTO tn (date, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                (time.strftime('%Y-%m-%d %H:%M:%S'), tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, "Passed")
+                                "SELECT 1 FROM tn WHERE id<>? AND (tla1=? OR conv1=? OR tla2=? OR conv2=?) LIMIT 1",
+                                (base_id, s, s, s, s)
                             )
-                            conn.commit()
-                        else:
-                            plc.write((PLC_TAGS['TN_CHECK_FAIL'], True))
-                            if tla1_exists or conv1_exists:
-                                logger.error("LH Assembly Duplicate Serial Number Failure")
-                                cursor.execute(
-                                    "INSERT INTO tn (date, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                    (time.strftime('%Y-%m-%d %H:%M:%S'), tla1, tla1_date, conv1, conv1_date, "N/A - LH Failed", "N/A - LH Failed", "N/A - LH Failed", "N/A - LH Failed", "LH Assembly Duplicate Serial Number Failure")
-                                )
-                            elif tla2_exists or conv2_exists:
-                                logger.error("RH Assembly Duplicate Serial Number Failure")
-                                cursor.execute(
-                                    "INSERT INTO tn (date, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                    (time.strftime('%Y-%m-%d %H:%M:%S'), "N/A - RH Failed", "N/A - RH Failed", "N/A - RH Failed", "N/A - RH Failed", tla2, tla2_date, conv2, conv2_date, "RH Assembly Duplicate Serial Number Failure")
-                                )
-                            conn.commit()
+                            if cursor.fetchone():
+                                unique_ok = False
+                                break
+                        if not unique_ok:
+                            logger.warning("Rework gate fail: serial not unique to base row")
+                            safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], False, verify=True, retries=3)
+                            continue
+
+                        cursor.execute(
+                            "SELECT COUNT(*) FROM tn WHERE tla1=? AND conv1=? AND tla2=? AND conv2=? AND status='Rework Pass'",
+                            (tla1, conv1, tla2, conv2)
+                        )
+                        rework_pass_count = cursor.fetchone()[0]
+
+                        if rework_pass_count == 0:
+                            # First rework allowed
+                            safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], True, verify=True, retries=3)
+                            logger.info("Rework gating pass: first rework (prior_reworks=0)")
+
+                            # Wait for torque result
+                            while True:
+                                torque_pass = bool(read_tag(plc, PLC_TAGS['TORQUE_PASS']))
+                                torque_fail = bool(read_tag(plc, PLC_TAGS['TORQUE_FAIL']))
+                                if torque_pass:
+                                    insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
+                                    replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
+                                    write_plc_message(plc, "")
+                                    logger.info("Inserted Rework Pass record")
+                                    # Wait for cycle reset to allow a clean next cycle
+                                    while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
+                                        time.sleep(FAST_POLL_INTERVAL)
+                                    break
+                                if torque_fail:
+                                    # wait for reset
+                                    while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
+                                        time.sleep(FAST_POLL_INTERVAL)
+                                    break
+                                if not read_tag(plc, PLC_TAGS['SCAN_COMPLETE']):
+                                    break
+                                time.sleep(POLL_INTERVAL)
+                            continue
+
+                        # Additional reworks require supervisor override
+                        write_plc_message(plc, "Rework Count >0, Supervisor Override Required.")
+                        safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], False, verify=True, retries=3)
+
+                        # Wait for supervisor or reset
+                        while True:
+                            if read_tag(plc, PLC_TAGS['SEQ_STEP']) == 10:
+                                write_plc_message(plc, "")
+                                logger.info("Rework override aborted due to cycle reset (SEQ_STEP 10)")
+                                break
+                            if read_tag(plc, PLC_TAGS['SUPERVISOR_KEY']):
+                                write_plc_message(plc, "Supervisor Override Accepted.")
+                                safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], True, verify=True, retries=3)
+                                logger.info("Supervisor override granted; proceeding with torque gating")
+                                # Torque gating after override
+                                while True:
+                                    torque_pass = bool(read_tag(plc, PLC_TAGS['TORQUE_PASS']))
+                                    torque_fail = bool(read_tag(plc, PLC_TAGS['TORQUE_FAIL']))
+                                    if torque_pass:
+                                        # read serials fresh
+                                        tla1 = (read_tag(plc, PLC_TAGS['TLA1']) or '').strip()
+                                        conv1 = (read_tag(plc, PLC_TAGS['CONV1']) or '').strip()
+                                        tla2 = (read_tag(plc, PLC_TAGS['TLA2']) or '').strip()
+                                        conv2 = (read_tag(plc, PLC_TAGS['CONV2']) or '').strip()
+                                        insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
+                                        replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
+                                        write_plc_message(plc, "")
+                                        logger.info("Inserted Rework Pass record (override)")
+                                        # wait for reset
+                                        while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
+                                            time.sleep(FAST_POLL_INTERVAL)
+                                        break
+                                    if torque_fail:
+                                        logger.warning("Rework torque fail (override) – no insert; wait reset")
+                                        while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
+                                            time.sleep(FAST_POLL_INTERVAL)
+                                        break
+                                    if not read_tag(plc, PLC_TAGS['SCAN_COMPLETE']):
+                                        break
+                                    time.sleep(POLL_INTERVAL)
+                                break
+                            time.sleep(POLL_INTERVAL)
+                        continue
+
+                    # Normal mode
+                    def dup_exists(col_prefix: str, serial: str, serial_date: str) -> bool:
+                        if not serial:
+                            return True
+                        cursor.execute(
+                            f"SELECT 1 FROM tn WHERE {col_prefix}_date=? AND {col_prefix}=? LIMIT 1",
+                            (serial_date, serial)
+                        )
+                        return cursor.fetchone() is not None
+
+                    tla1_dup = dup_exists('tla1', tla1, tla1_date)
+                    conv1_dup = dup_exists('conv1', conv1, conv1_date)
+                    tla2_dup = dup_exists('tla2', tla2, tla2_date)
+                    conv2_dup = dup_exists('conv2', conv2, conv2_date)
+                    lh_fail = tla1_dup or conv1_dup
+                    rh_fail = tla2_dup or conv2_dup
+
+                    safe_write(plc, PLC_TAGS['TN_CHECK_FAIL_LH'], lh_fail, verify=True, retries=3)
+                    safe_write(plc, PLC_TAGS['TN_CHECK_FAIL_RH'], rh_fail, verify=True, retries=3)
+                    safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], not (lh_fail or rh_fail), verify=True, retries=3)
+
+                    if not lh_fail and not rh_fail:
+                        logger.info("Normal pass gating – waiting torque result")
+                        while True:
+                            torque_pass = bool(read_tag(plc, PLC_TAGS['TORQUE_PASS']))
+                            torque_fail = bool(read_tag(plc, PLC_TAGS['TORQUE_FAIL']))
+                            if torque_pass:
+                                insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Passed')
+                                replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Passed')
+                                write_plc_message(plc, "")
+                                logger.info("Inserted Pass record")
+                                # wait for reset
+                                while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
+                                    time.sleep(FAST_POLL_INTERVAL)
+                                break
+                            if torque_fail:
+                                # Wait for reset
+                                while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
+                                    time.sleep(FAST_POLL_INTERVAL)
+                                break
+                            if not read_tag(plc, PLC_TAGS['SCAN_COMPLETE']):
+                                break
+                            time.sleep(POLL_INTERVAL)
+                        continue
+
+                    if lh_fail and not rh_fail:
+                        cursor.execute(
+                            "SELECT tla1 FROM tn WHERE (tla1=? OR conv1=? ) ORDER BY id ASC LIMIT 1",
+                            (tla1, conv1)
+                        )
+                        row = cursor.fetchone()
+                        first_tla = row[0] if row else 'Unknown'
+                        status = f"LH failed - first TLA: {first_tla}"
+                        insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, 'N/A', '', 'N/A', '', status)
+                        replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, 'N/A', '', 'N/A', '', status)
+                        logger.warning("Partial failure recorded (LH)")
+                        continue
+
+                    if rh_fail and not lh_fail:
+                        cursor.execute(
+                            "SELECT tla2 FROM tn WHERE (tla2=? OR conv2=? ) ORDER BY id ASC LIMIT 1",
+                            (tla2, conv2)
+                        )
+                        row = cursor.fetchone()
+                        first_tla = row[0] if row else 'Unknown'
+                        status = f"RH failed - first TLA: {first_tla}"
+                        insert_tn_record(db_file, ts, 'N/A', '', 'N/A', '', tla2, tla2_date, conv2, conv2_date, status)
+                        replicate_tn_to_backups(ts, 'N/A', '', 'N/A', '', tla2, tla2_date, conv2, conv2_date, status)
+                        logger.warning("Partial failure recorded (RH)")
+                        continue
+
+                    if lh_fail and rh_fail:
+                        cursor.execute(
+                            "SELECT tla1 FROM tn WHERE (tla1=? OR conv1=? ) ORDER BY id ASC LIMIT 1",
+                            (tla1, conv1)
+                        )
+                        row = cursor.fetchone()
+                        first_lh = row[0] if row else 'Unknown'
+                        cursor.execute(
+                            "SELECT tla2 FROM tn WHERE (tla2=? OR conv2=? ) ORDER BY id ASC LIMIT 1",
+                            (tla2, conv2)
+                        )
+                        row = cursor.fetchone()
+                        first_rh = row[0] if row else 'Unknown'
+                        status = f"LH failed - first TLA: {first_lh} & RH failed - first TLA: {first_rh}"
+                        insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, status)
+                        replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, status)
+                        logger.error("Dual failure recorded")
+                        continue
 
                 except sqlite3.Error as db_err:
-                    logger.exception("SQLite error occurred: %s", db_err)
-                except Exception as e:
-                    logger.exception("Unexpected error in monitor_and_update: %s", e)
-    except Exception as e:
-        logger.exception("Critical failure in monitor_and_update: %s", e)
+                    logger.exception("SQLite error in monitor loop: %s", db_err)
+                except CommError as comm_err:
+                    logger.exception("PLC communication error: %s", comm_err)
+                    time.sleep(RETRY_DELAY)
+                except Exception:
+                    logger.exception("Unexpected error in monitor loop")
+    except Exception:
+        logger.exception("Fatal error establishing PLC monitor loop")
         sys.exit(1)
-
 
 def validate_db_schema(db_file: str) -> None:
     """
@@ -915,43 +963,62 @@ def validate_db_schema(db_file: str) -> None:
         sys.exit(1)
 
 def ensure_all_dbs_initialized():
-    """
-    Ensure that all database paths (local, usbdrive, usbdrive2) are initialized with the correct schema.
-    """
+    """Ensure all known database files have the required schema."""
     db_paths = [default_local_db, USB_DB_BACKUP, USB_DB_BACKUP2]
     for db_path in db_paths:
         logger.info("Ensuring database schema for %s", db_path)
         ensure_db_schema(db_path)
         logger.info("Database schema ensured for %s", db_path)
 
+
+def initialize_environment(db_file: str) -> None:
+    """Prepare local and backup DBs, perform initial sync, and start USB watchers."""
+    # Ensure log directory exists
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        logger.exception("Failed to ensure log directory %s", log_dir)
+
+    # Ensure local and backup DB directories and schemas exist (create if missing)
+    db_paths = [db_file, USB_DB_BACKUP, USB_DB_BACKUP2]
+    for path in db_paths:
+        parent = os.path.dirname(path) or '.'
+        try:
+            if not os.path.exists(parent):
+                os.makedirs(parent, exist_ok=True)
+        except Exception:
+            logger.exception("Failed to create parent directory for %s", path)
+        try:
+            # ensure_db_schema is idempotent
+            ensure_db_schema(path)
+        except Exception:
+            logger.exception("ensure_db_schema failed for %s", path)
+
+    # Initial tri-directional sync (non-fatal)
+    try:
+        sync_db_from_backup(db_file)
+    except Exception:
+        logger.exception("Initial tri-directional sync failed (continuing)")
+
+    # Start USB watcher threads for one-way sync on mount
+    for idx, path in enumerate(USB_DB_BACKUPS, start=1):
+        name = f"usb{idx}"
+        try:
+            t = threading.Thread(target=watch_usb_and_sync, args=(db_file, path, name), daemon=True)
+            t.start()
+            logger.info("Started USB watch thread for %s -> %s", name, path)
+        except Exception:
+            logger.exception("Failed to start watcher thread for %s", path)
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="TN barcode converter serial checker")
-    parser.add_argument("--plc", default="10.131.201.60", help="PLC IP address")
+    parser.add_argument("--plc", default="192.168.1.1", help="PLC IP address")
     parser.add_argument("--db", default=default_local_db, help="Path to SQLite DB file")
     args = parser.parse_args()
 
     db_file = os.path.expanduser(args.db)
-    # Validate the database schema before starting
-    logger.info("Validating database schema for %s", db_file)
-    validate_db_schema(db_file)
-    logger.info("Database schema validation completed for %s", db_file)
-
-    # ensure the local database file and 'tn' table exist
-    logger.info("Calling ensure_db_schema for %s", db_file)
-    ensure_db_schema(db_file)
-    logger.info("ensure_db_schema completed for %s", db_file)
-    logger.info("Starting tnpy: PLC=%s, DB=%s", args.plc, db_file)
-    logger.info("Calling sync_db_from_backup for %s", db_file)
-    sync_db_from_backup(db_file)
-    logger.info("sync_db_from_backup completed for %s", db_file)
-    # start background watcher for USB hotplug one-way sync
-    for idx, path in enumerate(USB_DB_BACKUPS, start=1):
-        name = f"usb{idx}"
-        threading.Thread(
-            target=watch_usb_and_sync,
-            args=(db_file, path, name),
-            daemon=True
-        ).start()
+    logger.info("Initializing environment for DB=%s", db_file)
+    initialize_environment(db_file)
     logger.info("Calling monitor_and_update with PLC=%s, DB=%s", args.plc, db_file)
     monitor_and_update(args.plc, db_file)
 

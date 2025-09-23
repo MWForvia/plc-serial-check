@@ -137,11 +137,13 @@ PLC_TAGS = {
     'TN_DB_ERROR':           'TN.DB_ERROR',
     'DB_ERROR_INFO':         'TN.DB_ERROR_INFO',
     'TN_MESSAGE':            'TN.MESSAGE',
+    'DB_ENTRY_SUCCESS':      'TN.DB_ENTRY_SUCCESS',
     'TORQUE_PASS':           'TN.TORQUE_PASS',
     'TORQUE_FAIL':           'TN.TORQUE_FAIL',
     'REWORK_MODE':           'TN.REWORK_MODE',
     'REWORK_AUTH':           'TN.REWORK_AUTH',
     'SUPERVISOR_KEY':       'TN.SUPERVISOR_KEY',
+    'DB_ENTRY_SUCCESS':     'TN.DB_ENTRY_SUCCESS',
 
     # Sequence step (not part of UDT)
     'SEQ_STEP':              'Local_Step_II_N',
@@ -593,8 +595,6 @@ def wait_for_torque_result(plc: LogixDriver) -> Optional[str]:
             return None
         if read_tag(plc, PLC_TAGS['TORQUE_PASS']):
             return 'pass'
-        if read_tag(plc, PLC_TAGS['TORQUE_FAIL']):
-            return 'fail'
         time.sleep(FAST_POLL_INTERVAL)
 
 
@@ -721,6 +721,11 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             # Ensure REWORK_AUTH is cleared on cycle reset so PLC HMI isn't left waiting
                             safe_write(plc, PLC_TAGS['REWORK_AUTH'], False, verify=True, retries=3)
                             write_plc_message(plc, "")
+                            # clear DB entry success flag on reset
+                            try:
+                                safe_write(plc, PLC_TAGS['DB_ENTRY_SUCCESS'], False, verify=True, retries=3)
+                            except Exception:
+                                logger.exception("Failed to clear DB_ENTRY_SUCCESS on reset")
                             cycle_reset_done = True
                     else:
                         cycle_reset_done = False
@@ -790,6 +795,10 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                 insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
                                 replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
                                 write_plc_message(plc, "")
+                                try:
+                                    safe_write(plc, PLC_TAGS['DB_ENTRY_SUCCESS'], True, verify=True, retries=3)
+                                except Exception:
+                                    logger.exception("Failed to set DB_ENTRY_SUCCESS after rework pass")
                                 logger.info("Inserted Rework Pass record")
                                 # Wait for cycle reset to allow a clean next cycle
                                 while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
@@ -829,6 +838,10 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                     insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
                                     replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
                                     write_plc_message(plc, "REWORK PASS")
+                                    try:
+                                        safe_write(plc, PLC_TAGS['DB_ENTRY_SUCCESS'], True, verify=True, retries=3)
+                                    except Exception:
+                                        logger.exception("Failed to set DB_ENTRY_SUCCESS after rework pass (override)")
                                     logger.info("Inserted Rework Pass record (override)")
                                     # wait for reset
                                     while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
@@ -867,6 +880,10 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Passed')
                             replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Passed')
                             write_plc_message(plc, "PASS")
+                            try:
+                                safe_write(plc, PLC_TAGS['DB_ENTRY_SUCCESS'], True, verify=True, retries=3)
+                            except Exception:
+                                logger.exception("Failed to set DB_ENTRY_SUCCESS after pass")
                             logger.info("Inserted Pass record")
                             # wait for reset
                             while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:

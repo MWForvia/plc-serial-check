@@ -145,7 +145,6 @@ PLC_TAGS = {
 
     # Sequence step (not part of UDT)
     'SEQ_STEP':              'Local_Step_II_N',
-    'HSCAN_GOOD':            'HScan.Good',
     'TLA1':                  'PN.C2_TLA1_TN',
     'CONV1':                 'PN.C2_CONV1_TN',
     'TLA2':                  'PN.C2_TLA2_TN',
@@ -168,11 +167,11 @@ def extract_julian(serial: Any) -> str:
     s = str(serial or "")
     return s[2:7] if len(s) >= 7 else ""
 
-# Detailed DB error info codes for TN.DB_ERROR_INFO
+# Detailed DB error info messages for TN.DB_ERROR_INFO (PLC STRING)
 DB_ERROR_INFO_CODES = {
-    'SCHEMA_ERROR':        1,  # failed to create or migrate schema
-    'WRITE_ERROR':         2,  # failed to write record to DB
-    'REWORK_LOOKUP_ERROR': 3,  # failed during rework DB lookup
+    'SCHEMA_ERROR':        'Schema error',
+    'WRITE_ERROR':         'Write failed',
+    'REWORK_LOOKUP_ERROR': 'Rework lookup error',
 }
 # helper to write a message string back to PLC TN.Message tag
 def write_plc_message(plc: LogixDriver, message: str) -> None:
@@ -213,12 +212,7 @@ def safe_write(plc: Optional[LogixDriver], tag_name: str, value: Any, verify: bo
         if len(value) > 80:
             value = value[:80]
 
-    # Ensure DB_ERROR_INFO writes are integers
-    try:
-        if tag_name == PLC_TAGS.get('DB_ERROR_INFO'):
-            value = int(value or 0)
-    except Exception:
-        value = 0
+    # No coercion here — DB_ERROR_INFO is a PLC STRING for this PLC
 
     for attempt in range(1, retries + 1):
         try:
@@ -586,6 +580,24 @@ def wait_for_fail_or_reset(plc: LogixDriver) -> bool:
         time.sleep(FAST_POLL_INTERVAL)
 
 
+def wait_for_torque_result(plc: LogixDriver) -> Optional[str]:
+    """
+    Active-poll torque result. Returns 'pass' if `TORQUE_PASS` goes high,
+    'fail' if `TORQUE_FAIL` goes high, or None if SEQ_STEP==10 (reset) or
+    SCAN_COMPLETE clears.
+    """
+    while True:
+        if read_tag(plc, PLC_TAGS['SEQ_STEP']) == 10:
+            return None
+        if not read_tag(plc, PLC_TAGS['SCAN_COMPLETE']):
+            return None
+        if read_tag(plc, PLC_TAGS['TORQUE_PASS']):
+            return 'pass'
+        if read_tag(plc, PLC_TAGS['TORQUE_FAIL']):
+            return 'fail'
+        time.sleep(FAST_POLL_INTERVAL)
+
+
 def check_converter_sn(cursor: sqlite3.Cursor, column: str, sn: Any, label: str) -> bool:
     julian_date = extract_julian(sn)
     cursor.execute(
@@ -640,7 +652,8 @@ def insert_tn_record(db_path: str, timestamp: str, tla1: Any, tla1_date: Any, co
                 plc = globals().get('plc')
                 if plc:
                     safe_write(plc, PLC_TAGS['TN_DB_ERROR'], False, verify=True, retries=3)
-                    safe_write(plc, PLC_TAGS['DB_ERROR_INFO'], 0, verify=True, retries=3)
+                    # clear DB_ERROR_INFO on success
+                    safe_write(plc, PLC_TAGS['DB_ERROR_INFO'], "", verify=True, retries=3)
             except Exception:
                 pass
             label = "USB backup database" if db_path.startswith("/media") else "local database"
@@ -694,7 +707,6 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
             ensure_db_schema(db_file)
             conn = get_db_connection(db_file)
             cursor = conn.cursor()
-            scan_consumed = False
             cycle_reset_done = False  # debounce flag for SEQ_STEP 10 reset handling
 
             while True:
@@ -709,22 +721,14 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             # Ensure REWORK_AUTH is cleared on cycle reset so PLC HMI isn't left waiting
                             safe_write(plc, PLC_TAGS['REWORK_AUTH'], False, verify=True, retries=3)
                             write_plc_message(plc, "")
-                            scan_consumed = False
                             cycle_reset_done = True
                     else:
                         cycle_reset_done = False
 
-                    # Detect mode and scan completeness
+                    # Detect mode and wait for scan to be active (level-detect)
                     rework_mode = bool(read_tag(plc, PLC_TAGS['REWORK_MODE']))
-                    scan_complete = bool(read_tag(plc, PLC_TAGS['SCAN_COMPLETE']))
-                    if not scan_complete:
-                        scan_consumed = False
-                        time.sleep(POLL_INTERVAL)
-                        continue
-                    if scan_consumed:
-                        time.sleep(POLL_INTERVAL)
-                        continue
-                    scan_consumed = True
+                    # Wait until SCAN_COMPLETE is true (level detect) before proceeding
+                    wait_for_tag(plc, 'SCAN_COMPLETE')
 
                     # Read serials safely
                     tla1 = (read_tag(plc, PLC_TAGS['TLA1']) or '').strip()
@@ -780,27 +784,18 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], True, verify=True, retries=3)
                             logger.info("Rework gating pass: first rework (prior_reworks=0)")
 
-                            # Wait for torque result
-                            while True:
-                                torque_pass = bool(read_tag(plc, PLC_TAGS['TORQUE_PASS']))
-                                torque_fail = bool(read_tag(plc, PLC_TAGS['TORQUE_FAIL']))
-                                if torque_pass:
-                                    insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
-                                    replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
-                                    write_plc_message(plc, "")
-                                    logger.info("Inserted Rework Pass record")
-                                    # Wait for cycle reset to allow a clean next cycle
-                                    while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
-                                        time.sleep(FAST_POLL_INTERVAL)
-                                    break
-                                if torque_fail:
-                                    # wait for reset
-                                    while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
-                                        time.sleep(FAST_POLL_INTERVAL)
-                                    break
-                                if not read_tag(plc, PLC_TAGS['SCAN_COMPLETE']):
-                                    break
-                                time.sleep(POLL_INTERVAL)
+                            # Active-wait for torque result (level detect)
+                            tr = wait_for_torque_result(plc)
+                            if tr == 'pass':
+                                insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
+                                replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
+                                write_plc_message(plc, "")
+                                logger.info("Inserted Rework Pass record")
+                                # Wait for cycle reset to allow a clean next cycle
+                                while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
+                                    time.sleep(FAST_POLL_INTERVAL)
+                            # if tr is 'fail' or None, just continue to next cycle (no insert)
+                            continue
                             continue
 
                         # Additional reworks require supervisor override
@@ -823,32 +818,23 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                 write_plc_message(plc, "Rework: Supervisor accepted")
                                 safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], True, verify=True, retries=3)
                                 logger.info("Supervisor override granted; proceeding with torque gating")
-                                # Torque gating after override
-                                while True:
-                                    torque_pass = bool(read_tag(plc, PLC_TAGS['TORQUE_PASS']))
-                                    torque_fail = bool(read_tag(plc, PLC_TAGS['TORQUE_FAIL']))
-                                    if torque_pass:
-                                        # read serials fresh
-                                        tla1 = (read_tag(plc, PLC_TAGS['TLA1']) or '').strip()
-                                        conv1 = (read_tag(plc, PLC_TAGS['CONV1']) or '').strip()
-                                        tla2 = (read_tag(plc, PLC_TAGS['TLA2']) or '').strip()
-                                        conv2 = (read_tag(plc, PLC_TAGS['CONV2']) or '').strip()
-                                        insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
-                                        replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
-                                        write_plc_message(plc, "")
-                                        logger.info("Inserted Rework Pass record (override)")
-                                        # wait for reset
-                                        while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
-                                            time.sleep(FAST_POLL_INTERVAL)
-                                        break
-                                    if torque_fail:
-                                        logger.warning("Rework torque fail (override) – no insert; wait reset")
-                                        while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
-                                            time.sleep(FAST_POLL_INTERVAL)
-                                        break
-                                    if not read_tag(plc, PLC_TAGS['SCAN_COMPLETE']):
-                                        break
-                                    time.sleep(POLL_INTERVAL)
+                                # Torque gating after override (active-poll)
+                                tr = wait_for_torque_result(plc)
+                                if tr == 'pass':
+                                    # read serials fresh
+                                    tla1 = (read_tag(plc, PLC_TAGS['TLA1']) or '').strip()
+                                    conv1 = (read_tag(plc, PLC_TAGS['CONV1']) or '').strip()
+                                    tla2 = (read_tag(plc, PLC_TAGS['TLA2']) or '').strip()
+                                    conv2 = (read_tag(plc, PLC_TAGS['CONV2']) or '').strip()
+                                    insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
+                                    replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
+                                    write_plc_message(plc, "REWORK PASS")
+                                    logger.info("Inserted Rework Pass record (override)")
+                                    # wait for reset
+                                    while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
+                                        time.sleep(FAST_POLL_INTERVAL)
+                                else:
+                                    logger.warning("Rework torque not passed (override) – no insert; continuing")
                                 break
                             time.sleep(POLL_INTERVAL)
                         continue
@@ -876,26 +862,17 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
 
                     if not lh_fail and not rh_fail:
                         logger.info("Normal pass gating – waiting torque result")
-                        while True:
-                            torque_pass = bool(read_tag(plc, PLC_TAGS['TORQUE_PASS']))
-                            torque_fail = bool(read_tag(plc, PLC_TAGS['TORQUE_FAIL']))
-                            if torque_pass:
-                                insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Passed')
-                                replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Passed')
-                                write_plc_message(plc, "")
-                                logger.info("Inserted Pass record")
-                                # wait for reset
-                                while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
-                                    time.sleep(FAST_POLL_INTERVAL)
-                                break
-                            if torque_fail:
-                                # Wait for reset
-                                while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
-                                    time.sleep(FAST_POLL_INTERVAL)
-                                break
-                            if not read_tag(plc, PLC_TAGS['SCAN_COMPLETE']):
-                                break
-                            time.sleep(POLL_INTERVAL)
+                        tr = wait_for_torque_result(plc)
+                        if tr == 'pass':
+                            insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Passed')
+                            replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Passed')
+                            write_plc_message(plc, "PASS")
+                            logger.info("Inserted Pass record")
+                            # wait for reset
+                            while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
+                                time.sleep(FAST_POLL_INTERVAL)
+                        else:
+                            logger.info("Torque did not pass or cycle reset detected; continuing")
                         continue
 
                     if lh_fail and not rh_fail:
@@ -908,6 +885,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         status = f"LH failed - first TLA: {first_tla}"
                         insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, 'N/A', '', 'N/A', '', status)
                         replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, 'N/A', '', 'N/A', '', status)
+                        write_plc_message(plc, "LH FAIL, Re-use RH and notify Quality about LH")
                         logger.warning("Partial failure recorded (LH)")
                         continue
 
@@ -921,6 +899,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         status = f"RH failed - first TLA: {first_tla}"
                         insert_tn_record(db_file, ts, 'N/A', '', 'N/A', '', tla2, tla2_date, conv2, conv2_date, status)
                         replicate_tn_to_backups(ts, 'N/A', '', 'N/A', '', tla2, tla2_date, conv2, conv2_date, status)
+                        write_plc_message(plc, "RH FAIL, Re-use LH and notify Quality about RH")
                         logger.warning("Partial failure recorded (RH)")
                         continue
 
@@ -940,6 +919,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         status = f"LH failed - first TLA: {first_lh} & RH failed - first TLA: {first_rh}"
                         insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, status)
                         replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, status)
+                        write_plc_message(plc, "LH and RH FAIL, Notify Quality")
                         logger.error("Dual failure recorded")
                         continue
 

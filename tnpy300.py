@@ -113,6 +113,9 @@ metrics_logger.addHandler(metrics_handler)
 error_comm_count = 0
 error_unexpected_count = 0
 
+# Cache for change-detected logging of key PLC tag reads
+_READ_CACHE = {}
+
 # --- PLC driver import ---
 try:
     from pycomm3 import LogixDriver, CommError
@@ -291,10 +294,23 @@ def read_tag(plc: Optional[LogixDriver], tag_name: str) -> Any:
     if res is None:
         return None
     val = getattr(res, 'value', res)
-    # Log only for tags that advance the program (key tags)
-    key_tags = [PLC_TAGS.get('SEQ_STEP'), PLC_TAGS.get('SCAN_COMPLETE'), PLC_TAGS.get('TORQUE_PASS'), PLC_TAGS.get('REWORK_MODE'), PLC_TAGS.get('TLA1'), PLC_TAGS.get('CONV1'), PLC_TAGS.get('TLA2'), PLC_TAGS.get('CONV2')]
+    # Change-detected logging for key tags only
+    key_tags = [
+        PLC_TAGS.get('SEQ_STEP'),
+        PLC_TAGS.get('SCAN_COMPLETE'),
+        PLC_TAGS.get('TORQUE_PASS'),
+        PLC_TAGS.get('REWORK_MODE'),
+        PLC_TAGS.get('SUPERVISOR_KEY'),
+    ]
     if tag_name in key_tags:
-        logger.info(f"PLC READ: tag={tag_name} value={val!r}")
+        if tag_name not in _READ_CACHE:
+            logger.info(f"PLC READ INIT: tag={tag_name} value={val!r}")
+            _READ_CACHE[tag_name] = val
+        else:
+            prev = _READ_CACHE.get(tag_name)
+            if prev != val:
+                logger.info(f"PLC READ CHG: tag={tag_name} {prev!r} -> {val!r}")
+                _READ_CACHE[tag_name] = val
     return val
 
 
@@ -787,10 +803,24 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         # PLC shall be responsible for clearing TN.CYCLE_READY; only the host sets it high.
                         cycle_reset_done = False
 
+                    # Only proceed to scan gating when machine is in scan step (e.g., SEQ_STEP == 20)
+                    if seq_val != 20:
+                        time.sleep(FAST_POLL_INTERVAL)
+                        continue
                     # Detect mode and wait for scan to be active (level-detect)
                     rework_mode = bool(read_tag(plc, PLC_TAGS['REWORK_MODE']))
-                    # Wait until SCAN_COMPLETE is true (level detect) before proceeding
-                    wait_for_tag(plc, 'SCAN_COMPLETE')
+                    # Wait until SCAN_COMPLETE is true, but abort immediately on reset (SEQ_STEP==10)
+                    _aborted = False
+                    while True:
+                        if read_tag(plc, PLC_TAGS['SEQ_STEP']) == 10:
+                            logger.info("Reset detected while waiting for SCAN_COMPLETE; aborting scan sequence")
+                            _aborted = True
+                            break
+                        if read_tag(plc, PLC_TAGS['SCAN_COMPLETE']):
+                            break
+                        time.sleep(POLL_INTERVAL)
+                    if _aborted:
+                        continue
 
                     # Read serials safely
                     tla1 = (read_tag(plc, PLC_TAGS['TLA1']) or '').strip()

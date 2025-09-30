@@ -143,6 +143,7 @@ PLC_TAGS = {
     'REWORK_MODE':           'TN.REWORK_MODE',
     'REWORK_AUTH':           'TN.REWORK_AUTH',
     'SUPERVISOR_KEY':       'TN.SUPERVISOR_KEY',
+    'CYCLE_READY':           'TN.CYCLE_READY',
     'DB_ENTRY_SUCCESS':     'TN.DB_ENTRY_SUCCESS',
 
     # Sequence step (not part of UDT)
@@ -193,6 +194,7 @@ def write_plc_message(plc: LogixDriver, message: str) -> None:
 
 
 def safe_write(plc: Optional[LogixDriver], tag_name: str, value: Any, verify: bool = True, retries: int = 3) -> bool:
+    logger.info(f"PLC WRITE: tag={tag_name} value={value!r}")
     """
     Perform a write to the PLC and verify by reading the tag back.
     - Attempts up to `retries` times (including initial attempt).
@@ -288,8 +290,12 @@ def read_tag(plc: Optional[LogixDriver], tag_name: str) -> Any:
         return None
     if res is None:
         return None
-    # If driver returned an object with 'value' attribute, use it, otherwise return the object itself
-    return getattr(res, 'value', res)
+    val = getattr(res, 'value', res)
+    # Log only for tags that advance the program (key tags)
+    key_tags = [PLC_TAGS.get('SEQ_STEP'), PLC_TAGS.get('SCAN_COMPLETE'), PLC_TAGS.get('TORQUE_PASS'), PLC_TAGS.get('REWORK_MODE'), PLC_TAGS.get('TLA1'), PLC_TAGS.get('CONV1'), PLC_TAGS.get('TLA2'), PLC_TAGS.get('CONV2')]
+    if tag_name in key_tags:
+        logger.info(f"PLC READ: tag={tag_name} value={val!r}")
+    return val
 
 
 def ensure_db_schema(db_path: str) -> None:
@@ -563,9 +569,11 @@ def watch_usb_and_sync(local_db: str, usb_path: str, name: str) -> None:
 
 def wait_for_tag(plc: LogixDriver, tag_key: str) -> None:
     name = PLC_TAGS[tag_key]
+    logger.debug("Waiting for tag %s to become True", name)
     while True:
         val = read_tag(plc, name)
         if val:
+            logger.debug("Tag %s observed True; proceeding", name)
             return  # Proceed immediately if the tag is already true
         time.sleep(POLL_INTERVAL)
 
@@ -585,17 +593,48 @@ def wait_for_fail_or_reset(plc: LogixDriver) -> bool:
 def wait_for_torque_result(plc: LogixDriver) -> Optional[str]:
     """
     Active-poll torque result. Returns 'pass' if `TORQUE_PASS` goes high,
-    'fail' if `TORQUE_FAIL` goes high, or None if SEQ_STEP==10 (reset) or
-    SCAN_COMPLETE clears.
+    or None if SEQ_STEP==10 (reset) or SCAN_COMPLETE clears.
     """
+    logger.debug("Waiting for torque result (pass or reset/scan-clear)")
     while True:
         if read_tag(plc, PLC_TAGS['SEQ_STEP']) == 10:
+            logger.debug("Torque wait aborted: SEQ_STEP==10 detected (reset)")
             return None
         if not read_tag(plc, PLC_TAGS['SCAN_COMPLETE']):
+            logger.debug("Torque wait aborted: SCAN_COMPLETE cleared")
             return None
         if read_tag(plc, PLC_TAGS['TORQUE_PASS']):
+            logger.debug("Torque PASS observed")
             return 'pass'
         time.sleep(FAST_POLL_INTERVAL)
+
+def _disable_cip_timeouts(plc: LogixDriver) -> None:
+    """Best-effort: disable socket/CIP timeouts so waits can be long-lived.
+    Tries a few likely attributes; ignores failures. Logs what it changes.
+    """
+    try:
+        socket.setdefaulttimeout(None)
+        logger.debug("Set global socket default timeout to None")
+    except Exception:
+        logger.debug("Unable to set global socket default timeout", exc_info=True)
+    paths = [
+        ("_cli","socket"),
+        ("_client","socket"),
+        ("_conn","socket"),
+        ("socket",),
+        ("_sock",),
+    ]
+    for path in paths:
+        try:
+            obj = plc
+            for p in path:
+                obj = getattr(obj, p)
+            if hasattr(obj, 'settimeout'):
+                obj.settimeout(None)
+                logger.debug("Disabled timeout on plc.%s", '.'.join(path))
+        except Exception:
+            # ignore missing paths
+            continue
 
 
 def check_converter_sn(cursor: sqlite3.Cursor, column: str, sn: Any, label: str) -> bool:
@@ -605,8 +644,10 @@ def check_converter_sn(cursor: sqlite3.Cursor, column: str, sn: Any, label: str)
         (julian_date, sn)
     )
     if cursor.fetchone():
+        logger.info(f"SERIAL RESULT: {label} {sn} - NOK")
         logger.warning("%s Converter SN Failed: %s", label, sn)
         return False
+    logger.info(f"SERIAL RESULT: {label} {sn} - OK")
     logger.info("%s Converter SN Passed: %s", label, sn)
     return True
 
@@ -624,6 +665,7 @@ def set_pass(plc: LogixDriver, passed: bool) -> None:
 
 
 def insert_tn_record(db_path: str, timestamp: str, tla1: Any, tla1_date: Any, conv1: Any, conv1_date: Any, tla2: Any, tla2_date: Any, conv2: Any, conv2_date: Any, status: str) -> None:
+    logger.info(f"DB STORE: {db_path} date={timestamp} tla1={tla1} tla1_date={tla1_date} conv1={conv1} conv1_date={conv1_date} tla2={tla2} tla2_date={tla2_date} conv2={conv2} conv2_date={conv2_date} status={status}")
     """
     Insert a record into the tn table with the updated schema.
     """
@@ -703,6 +745,11 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                 plc._cli.socket.settimeout(None)
             except Exception:
                 pass
+            # Also try to disable other potential timeouts in the stack
+            try:
+                _disable_cip_timeouts(plc)
+            except Exception:
+                logger.debug("_disable_cip_timeouts encountered an error", exc_info=True)
             logger.info("PLC connection established.")
             ensure_db_schema(db_file)
             conn = get_db_connection(db_file)
@@ -715,6 +762,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                     seq_val = read_tag(plc, PLC_TAGS['SEQ_STEP'])
                     if seq_val == 10:
                         if not cycle_reset_done:
+                            logger.info("SEQ_STEP==10 detected; clearing per-cycle flags and preparing for next cycle")
                             safe_write(plc, PLC_TAGS['TN_CHECK_FAIL_LH'], False, verify=True, retries=3)
                             safe_write(plc, PLC_TAGS['TN_CHECK_FAIL_RH'], False, verify=True, retries=3)
                             safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], False, verify=True, retries=3)
@@ -726,8 +774,17 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                 safe_write(plc, PLC_TAGS['DB_ENTRY_SUCCESS'], False, verify=True, retries=3)
                             except Exception:
                                 logger.exception("Failed to clear DB_ENTRY_SUCCESS on reset")
+                            # signal to PLC that Python is ready for next cycle
+                            try:
+                                logger.info("Setting TN.CYCLE_READY True after reset completion")
+                                safe_write(plc, PLC_TAGS['CYCLE_READY'], True, verify=True, retries=3)
+                                logger.info("Asserted TN.CYCLE_READY True after Python reset completion")
+                            except Exception:
+                                logger.exception("Failed to set CYCLE_READY on reset completion")
                             cycle_reset_done = True
                     else:
+                        # leaving SEQ_STEP 10: do not clear CYCLE_READY here
+                        # PLC shall be responsible for clearing TN.CYCLE_READY; only the host sets it high.
                         cycle_reset_done = False
 
                     # Detect mode and wait for scan to be active (level-detect)
@@ -745,6 +802,13 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                     tla2_date = extract_julian(tla2)
                     conv2_date = extract_julian(conv2)
                     ts = time.strftime('%Y-%m-%d %H:%M:%S')
+                    serials = [
+                        ("TLA1", tla1),
+                        ("CONV1", conv1),
+                        ("TLA2", tla2),
+                        ("CONV2", conv2),
+                    ]
+                    logger.info("SERIALS CHECKED: " + ", ".join(f"{label}={sn}" for label, sn in serials))
 
                     if rework_mode:
                         # Rework gating

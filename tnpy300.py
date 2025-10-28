@@ -812,7 +812,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             cr = read_tag(plc, PLC_TAGS['CYCLE_READY'])
                             if not cr:
                                 logger.info("Maintaining TN.CYCLE_READY True while SEQ_STEP==10")
-                                safe_write(plc, PLC_TAGS['CYCLE_READY'], True, verify=True, retries=2, verify_delay=0.15)
+                                safe_write(plc, PLC_TAGS['CYCLE_READY'], True, verify=True, retries=5, verify_delay=0.5)
                         except Exception:
                             logger.debug("Unable to maintain TN.CYCLE_READY while in step 10", exc_info=True)
                     else:

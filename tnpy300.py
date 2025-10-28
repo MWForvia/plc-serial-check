@@ -140,6 +140,7 @@ PLC_TAGS = {
     'TN_DB_ERROR':           'TN.DB_ERROR',
     'DB_ERROR_INFO':         'TN.DB_ERROR_INFO',
     'TN_MESSAGE':            'TN.MESSAGE',
+    'TN_MESSAGE_ACTIVE':     'TN.MESSAGE_ACTIVE',
     'DB_ENTRY_SUCCESS':      'TN.DB_ENTRY_SUCCESS',
     'TORQUE_PASS':           'TN.TORQUE_PASS',
     'TORQUE_FAIL':           'TN.TORQUE_FAIL',
@@ -190,6 +191,12 @@ def write_plc_message(plc: LogixDriver, message: str) -> None:
             msg = msg[:80]
         # use verified write helper so failures are retried and reported
         ok = safe_write(plc, PLC_TAGS['TN_MESSAGE'], msg, verify=True, retries=3)
+        # Set/clear active flag to mirror presence of a message
+        active = bool(msg) if ok else False
+        try:
+            safe_write(plc, PLC_TAGS['TN_MESSAGE_ACTIVE'], active, verify=True, retries=2)
+        except Exception:
+            logger.debug("Failed to update TN.Message_Active", exc_info=True)
         if not ok:
             logger.error("TN.Message write failed after retries: %s", msg)
     except Exception:
@@ -790,6 +797,12 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                 safe_write(plc, PLC_TAGS['DB_ENTRY_SUCCESS'], False, verify=True, retries=3)
                             except Exception:
                                 logger.exception("Failed to clear DB_ENTRY_SUCCESS on reset")
+                            # clear DB error flags at cycle start; any new DB failure will re-raise them
+                            try:
+                                safe_write(plc, PLC_TAGS['TN_DB_ERROR'], False, verify=True, retries=2)
+                                safe_write(plc, PLC_TAGS['DB_ERROR_INFO'], "", verify=True, retries=2)
+                            except Exception:
+                                logger.exception("Failed to clear TN.DB_ERROR/DB_ERROR_INFO on reset")
                             cycle_reset_done = True
                         # Always assert CYCLE_READY while we are in step 10 so missed edges don't block startup
                         try:
@@ -919,7 +932,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             if read_tag(plc, PLC_TAGS['SUPERVISOR_KEY']):
                                 # Supervisor accepted — clear auth request and proceed
                                 safe_write(plc, PLC_TAGS['REWORK_AUTH'], False, verify=True, retries=3)
-                                write_plc_message(plc, "Rework: Supervisor accepted")
+                                # write_plc_message(plc, "Rework: Supervisor accepted")  # removed to avoid overriding HMI instructions
                                 safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], True, verify=True, retries=3)
                                 logger.info("Supervisor override granted; proceeding with torque gating")
                                 # Torque gating after override (active-poll)
@@ -932,7 +945,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                     conv2 = (read_tag(plc, PLC_TAGS['CONV2']) or '').strip()
                                     insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
                                     replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
-                                    write_plc_message(plc, "REWORK PASS")
+                                    # write_plc_message(plc, "REWORK PASS")  # removed to avoid overriding HMI instructions
                                     try:
                                         safe_write(plc, PLC_TAGS['DB_ENTRY_SUCCESS'], True, verify=True, retries=3)
                                     except Exception:
@@ -974,7 +987,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         if tr == 'pass':
                             insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Passed')
                             replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Passed')
-                            write_plc_message(plc, "PASS")
+                            # write_plc_message(plc, "PASS")  # removed to avoid overriding HMI instructions
                             try:
                                 safe_write(plc, PLC_TAGS['DB_ENTRY_SUCCESS'], True, verify=True, retries=3)
                             except Exception:

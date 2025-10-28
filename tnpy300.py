@@ -203,7 +203,7 @@ def write_plc_message(plc: LogixDriver, message: str) -> None:
         logger.exception("Failed to write PLC message")
 
 
-def safe_write(plc: Optional[LogixDriver], tag_name: str, value: Any, verify: bool = True, retries: int = 3) -> bool:
+def safe_write(plc: Optional[LogixDriver], tag_name: str, value: Any, verify: bool = True, retries: int = 3, verify_delay: float = 0.15) -> bool:
     logger.info(f"PLC WRITE: tag={tag_name} value={value!r}")
     """
     Perform a write to the PLC and verify by reading the tag back.
@@ -250,6 +250,9 @@ def safe_write(plc: Optional[LogixDriver], tag_name: str, value: Any, verify: bo
         if ok and verify:
             # Read-back verification
             try:
+                # Optional small pause before verifying to allow PLC logic to settle
+                if verify_delay and verify_delay > 0:
+                    time.sleep(verify_delay)
                 read_obj = plc.read(tag_name)
                 read_val = getattr(read_obj, 'value', read_obj)
                 # Normalise bytes/str differences
@@ -809,7 +812,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             cr = read_tag(plc, PLC_TAGS['CYCLE_READY'])
                             if not cr:
                                 logger.info("Maintaining TN.CYCLE_READY True while SEQ_STEP==10")
-                                safe_write(plc, PLC_TAGS['CYCLE_READY'], True, verify=True, retries=2)
+                                safe_write(plc, PLC_TAGS['CYCLE_READY'], True, verify=True, retries=2, verify_delay=0.15)
                         except Exception:
                             logger.debug("Unable to maintain TN.CYCLE_READY while in step 10", exc_info=True)
                     else:

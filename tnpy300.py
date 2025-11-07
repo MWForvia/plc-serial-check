@@ -377,6 +377,11 @@ POLL_INTERVAL      = 0.5   # general polling interval
 FAST_POLL_INTERVAL = 0.25   # fast polling for fail
 RETRY_DELAY        = 1    # seconds to wait before first retry
 MAX_RETRY_DELAY    = 5    # maximum seconds to back off on repeated errors
+
+# Connection resilience and observability
+SOCKET_TIMEOUT_SEC = float(os.getenv('TNPY300_SOCKET_TIMEOUT', '1.5'))  # PLC socket timeout; prevents indefinite hangs
+HEARTBEAT_INTERVAL_SEC = float(os.getenv('TNPY300_HEARTBEAT_SEC', '10'))  # periodic log while idling in SEQ_STEP 10
+READ_FAILS_RECONNECT = int(os.getenv('TNPY300_READ_FAILS_RECONNECT', '10'))  # consecutive read None before reconnect
 RESET_BACKOFF_TIMEOUT = 60  # seconds of stability to reset retry delay
 
 # --- USB health & formatting helpers ---
@@ -766,26 +771,35 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
     """Main monitoring loop with Normal + Rework mode gating."""
     try:
         with LogixDriver(plc_ip_address) as plc:
-            # ensure non-blocking socket behavior similar to prior code
+            # Configure PLC socket timeout to avoid indefinite blocking
             try:
-                plc._cli.socket.settimeout(None)
+                plc._cli.socket.settimeout(SOCKET_TIMEOUT_SEC)
+                logger.info("PLC socket timeout set to %.2fs", SOCKET_TIMEOUT_SEC)
             except Exception:
-                pass
-            # Also try to disable other potential timeouts in the stack
-            try:
-                _disable_cip_timeouts(plc)
-            except Exception:
-                logger.debug("_disable_cip_timeouts encountered an error", exc_info=True)
+                logger.debug("Unable to set PLC socket timeout", exc_info=True)
             logger.info("PLC connection established.")
             ensure_db_schema(db_file)
             conn = get_db_connection(db_file)
             cursor = conn.cursor()
             cycle_reset_done = False  # debounce flag for SEQ_STEP 10 reset handling
 
+            last_seq10_log = 0.0
+            consecutive_read_failures = 0
             while True:
                 try:
                     # Cycle reset handling
                     seq_val = read_tag(plc, PLC_TAGS['SEQ_STEP'])
+                    if seq_val is None:
+                        consecutive_read_failures += 1
+                        if consecutive_read_failures >= READ_FAILS_RECONNECT:
+                            logger.warning("Consecutive SEQ_STEP read failures (%d) – triggering reconnect", consecutive_read_failures)
+                            raise CommError("Too many read failures; reconnecting")
+                        time.sleep(FAST_POLL_INTERVAL)
+                        continue
+                    else:
+                        if consecutive_read_failures:
+                            logger.info("Cleared read failure streak after %d failures", consecutive_read_failures)
+                        consecutive_read_failures = 0
                     if seq_val == 10:
                         if not cycle_reset_done:
                             logger.info("SEQ_STEP==10 detected; clearing per-cycle flags and preparing for next cycle")
@@ -813,6 +827,10 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             if not cr:
                                 logger.info("Maintaining TN.CYCLE_READY True while SEQ_STEP==10")
                                 safe_write(plc, PLC_TAGS['CYCLE_READY'], True, verify=True, retries=2, verify_delay=0.15)
+                            now = time.time()
+                            if now - last_seq10_log >= HEARTBEAT_INTERVAL_SEC:
+                                logger.info("Heartbeat: still idling in SEQ_STEP 10; CYCLE_READY=%s", cr)
+                                last_seq10_log = now
                         except Exception:
                             logger.debug("Unable to maintain TN.CYCLE_READY while in step 10", exc_info=True)
                     else:
@@ -870,23 +888,10 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             continue
                         base_id = rows[0][0]
 
-                        # Ensure uniqueness of serials to base row
-                        unique_ok = True
-                        for s in (tla1, conv1, tla2, conv2):
-                            if not s:
-                                unique_ok = False
-                                break
-                            cursor.execute(
-                                "SELECT 1 FROM tn WHERE id<>? AND (tla1=? OR conv1=? OR tla2=? OR conv2=?) LIMIT 1",
-                                (base_id, s, s, s, s)
-                            )
-                            if cursor.fetchone():
-                                unique_ok = False
-                                break
-                        if not unique_ok:
-                            logger.warning("Rework gate fail: serial not unique to base row")
-                            safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], False, verify=True, retries=3)
-                            continue
+                        # Relax uniqueness: it's valid for these serials to appear in other rows (e.g., fails or prior attempts).
+                        # We already confirmed this exact 4-tuple has exactly one 'Passed' base row (base_id).
+                        # Proceed with rework using this base association.
+                        logger.info("Rework base association confirmed (base_id=%s); proceeding with rework checks", base_id)
 
                         cursor.execute(
                             "SELECT COUNT(*) FROM tn WHERE tla1=? AND conv1=? AND tla2=? AND conv2=? AND status='Rework Pass'",

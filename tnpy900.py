@@ -30,6 +30,7 @@ from datetime import datetime, timedelta
 import errno
 import json
 import socket
+import subprocess
 socket.setdefaulttimeout(None)
 
 # helper to open SQLite in WAL mode with relaxed sync
@@ -160,6 +161,8 @@ PLC_TAGS = {
     'ALLOW_MULTIPLE_REWORK': 'ALLOW_MULTIPLE_REWORK',
     'FORCE_REWORK_INPUT':    'I1.Data.15',
     'REWORK_TLA_WRITEBACK':  'ZEBRA.Working_String[33]',
+    # PLC LocalDateTime from GSV into a DINT[7] array
+    'PLC_TIME_ARRAY':        'PLC_Time_UDT',
 }
 
 SQL_STATEMENTS = {
@@ -640,10 +643,9 @@ def ensure_unique_finished_serial(plc: LogixDriver, cursor: sqlite3.Cursor, max_
                 return tla_sn
 
             # Duplicate, increment PLC serial number for current part selection
-            part_select = plc.read(PLC_TAGS['PART_SELECT']).value or 0
-            current_sn_num = plc.read(f"{PLC_TAGS['SERIAL_NUMBER']}[{part_select}]").value or 0
+            current_sn_num = plc.read(f"{PLC_TAGS['SERIAL_NUMBER']}[1]").value or 0
             next_sn_num = current_sn_num + 1
-            plc.write((f"{PLC_TAGS['SERIAL_NUMBER']}[{part_select}]", next_sn_num))
+            plc.write((f"{PLC_TAGS['SERIAL_NUMBER']}[1]", next_sn_num))
             logger.info("TLA duplicate detected for %s; incremented SERIAL_NUMBER[%s] to %s (attempt %d)",
                         tla_sn, part_select, next_sn_num, attempt)
             time.sleep(sleep_s)
@@ -798,6 +800,109 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
         logger.exception("handle_fail encountered an error")
 
 
+# Time sync settings
+TIME_SYNC_ENABLED = True          # turn off if not desired
+TIME_SYNC_INTERVAL_S = 10000         # how often to check PLC vs Pi
+TIME_SKEW_THRESHOLD_S = 2         # correct time if skew exceeds this
+
+def _plc_time_array(plc: LogixDriver) -> Optional[list]:
+    """
+    Read 7 DINTs written by GSV(LocalDateTime) into PLC_Time_UDT[0..6].
+    Returns [year, month, day, hour, minute, second, microsecond] or None.
+    """
+    tag = PLC_TAGS['PLC_TIME_ARRAY']
+    try:
+        # Preferred: block read starting at [0] for 7 elements
+        resp = plc.read((f"{tag}[0]", 7))
+        vals = getattr(resp, "value", None)
+        if isinstance(vals, (list, tuple)) and len(vals) >= 7:
+            return list(vals[:7])
+        # Fallback: read elements individually
+        vals = []
+        for i in range(7):
+            r = plc.read(f"{tag}[{i}]")
+            if not r or getattr(r, "error", None) is not None:
+                return None
+            vals.append(int(r.value))
+        return vals
+    except Exception:
+        logger.exception("Failed to read PLC LocalDateTime array")
+        return None
+
+def _plc_time_to_datetime(vals: list) -> Optional[datetime]:
+    """
+    Convert [Y,M,D,h,m,s,usec] to a naive local datetime.
+    """
+    try:
+        y, M, d, h, m, s, us = (int(vals[0]), int(vals[1]), int(vals[2]),
+                                int(vals[3]), int(vals[4]), int(vals[5]), int(vals[6]))
+        # clamp microseconds to valid range
+        us = max(0, min(us, 999999))
+        return datetime(y, M, d, h, m, s, us)
+    except Exception:
+        logger.exception("Invalid PLC time array: %r", vals)
+        return None
+
+def _set_pi_time(dt_local: datetime) -> bool:
+    """
+    Set system time using timedatectl. Returns True on success.
+    Requires service to run as root or sudo NOPASSWD for timedatectl.
+    """
+    try:
+        ts = dt_local.strftime("%Y-%m-%d %H:%M:%S")
+        # First try directly
+        r = subprocess.run(["sudo", "-n", "timedatectl", "set-time", ts],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if r.returncode == 0:
+            return True
+        # If NTP blocks manual set, disable then set
+        subprocess.run(["sudo", "-n", "timedatectl", "set-ntp", "false"],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        r2 = subprocess.run(["sudo", "-n", "timedatectl", "set-time", ts],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if r2.returncode != 0:
+            logger.error("timedatectl set-time failed: %s", r2.stderr.strip())
+            return False
+        return True
+    except Exception:
+        logger.exception("Failed to set system time via timedatectl")
+        return False
+
+def sync_pi_time_once(plc: LogixDriver) -> None:
+    """
+    Read PLC time once and update the Pi if skew exceeds threshold.
+    """
+    vals = _plc_time_array(plc)
+    if not vals:
+        return
+    plc_dt = _plc_time_to_datetime(vals)
+    if not plc_dt:
+        return
+    pi_now = datetime.now()
+    skew = (plc_dt - pi_now).total_seconds()
+    metrics_logger.info(json.dumps({
+        "timestamp": datetime.utcnow().isoformat(),
+        "metric": "time_skew_s", "value": skew
+    }))
+    if abs(skew) > TIME_SKEW_THRESHOLD_S:
+        ok = _set_pi_time(plc_dt)
+        logger.info("Time sync %s | PLC=%s | Pi(before)=%s | skew=%.3fs",
+                    "OK" if ok else "FAILED",
+                    plc_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    pi_now.strftime("%Y-%m-%d %H:%M:%S"),
+                    skew)
+
+def time_sync_worker(plc: LogixDriver) -> None:
+    """
+    Background thread to keep Pi time aligned with PLC time.
+    """
+    while True:
+        try:
+            sync_pi_time_once(plc)
+        except Exception:
+            logger.exception("Time sync worker error")
+        time.sleep(TIME_SYNC_INTERVAL_S)
+
 def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
 
      # create a persistent driver and open session once
@@ -811,6 +916,11 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
         globals()['plc'] = plc
         # Startup self-test for TN.Message
         self_test_tn_message(plc)
+        # Start PLC→Pi time sync thread
+        if TIME_SYNC_ENABLED:
+            threading.Thread(target=time_sync_worker, args=(plc,), daemon=True).start()
+            # also do an immediate one-shot sync at startup
+            sync_pi_time_once(plc)
     except Exception as e:
         logger.error("Initial PLC open failed: %s", e)
     logger.info("Entering monitor_and_update with PLC=%s, DB=%s", plc_ip_address, db_file)

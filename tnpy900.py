@@ -141,7 +141,8 @@ PLC_TAGS = {
     'TN_TLA_SN_CHECK_PASS':  'TN.TLA_SN_CHECK_PASS',
     # DB entry handshake
     'SERIAL_DB_ENTRY_COMPLETE': 'SERIAL_DB_ENTRY_COMPLETE',
-
+    # NEW: cycle-ready handshake bit
+    'PI_CYCLE_READY':          'TN.PI_CYCLE_READY',
     # Existing tags (from the PLC)
     'SERIAL_HOLDER':         'ZEBRA.Working_String[20]',    
     'LH_CONV':               'FIX_513D.Conv_Barcode.EXTRACT[2]',
@@ -181,6 +182,22 @@ def extract_julian(serial: Any) -> str:
     s = str(serial or "")
     return s[2:7] if len(s) >= 7 else ""
 
+def write_and_verify(plc: LogixDriver, tag: str, value: Any) -> bool:
+    """Write a tag and verify by reading it back."""
+    try:
+        wr = plc.write((tag, value))
+        if not wr or getattr(wr, 'error', None):
+            logger.error("Write failed: %s -> %r | err=%s", tag, value, getattr(wr, 'error', None))
+            return False
+        rb = plc.read(tag)
+        ok = rb and getattr(rb, 'error', None) is None and rb.value == value
+        if not ok:
+            logger.error("Readback mismatch: %s expected=%r got=%r", tag, value, rb.value if rb else None)
+        return ok
+    except Exception:
+        logger.exception("write_and_verify error for %s", tag)
+        return False
+    
 def extract_tla_from_barcode(barcode: Any, start_char_1_based: int = 47, length: int = 17) -> Optional[str]:
     """
     Extract the TLA serial from a full barcode string.
@@ -956,16 +973,26 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                 # clear pass/fail and TLA flags on sequence reset
                 seq_val = plc.read(PLC_TAGS['SEQ_STEP']).value
                 if seq_val == 0:
-                    plc.write((PLC_TAGS['TN_CHECK_PASS'], False))
-                    plc.write((PLC_TAGS['TN_CHECK_FAIL'], False))
-                    plc.write((PLC_TAGS['TN_TLA_SN_CHECK_PASS'], False))
-                    plc.write((PLC_TAGS['SERIAL_DB_ENTRY_COMPLETE'], False))
-                    plc.write((PLC_TAGS['REWORK_LABEL_FINISHED'], ""))
-                    plc.write((PLC_TAGS['TN_MANUAL_ENTRY'], ""))
-                    plc.write((PLC_TAGS['ALLOW_MULTIPLE_REWORK'], False))
-                    plc.write((PLC_TAGS['TN_MESSAGE'], ""))
-                    # do not write to SCAN_COMPLETE; reset local flags only
-                    # reset per-cycle leak-fail suppression flags
+                    # Hold PLC at step 0 until all resets succeed
+                    plc.write((PLC_TAGS['PI_CYCLE_READY'], False))
+
+                    ok = True
+                    ok &= write_and_verify(plc, PLC_TAGS['TN_CHECK_PASS'], False)
+                    ok &= write_and_verify(plc, PLC_TAGS['TN_CHECK_FAIL'], False)
+                    ok &= write_and_verify(plc, PLC_TAGS['TN_TLA_SN_CHECK_PASS'], False)
+                    ok &= write_and_verify(plc, PLC_TAGS['SERIAL_DB_ENTRY_COMPLETE'], False)
+                    ok &= write_and_verify(plc, PLC_TAGS['REWORK_LABEL_FINISHED'], "")
+                    ok &= write_and_verify(plc, PLC_TAGS['TN_MANUAL_ENTRY'], "")
+                    ok &= write_and_verify(plc, PLC_TAGS['ALLOW_MULTIPLE_REWORK'], False)
+                    ok &= write_and_verify(plc, PLC_TAGS['TN_MESSAGE'], "")
+
+                    if ok:
+                        plc.write((PLC_TAGS['PI_CYCLE_READY'], True))
+                        logger.debug("PI_CYCLE_READY set True; PLC may advance from step 0")
+                    else:
+                        logger.error("Reset handshake failed; PI_CYCLE_READY remains False")
+
+                    # reset per-cycle flags
                     leak_logged_normal = False
                     leak_logged_fpc = False
                     leak_logged_rework = False

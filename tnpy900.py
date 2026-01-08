@@ -143,6 +143,8 @@ PLC_TAGS = {
     'SERIAL_DB_ENTRY_COMPLETE': 'SERIAL_DB_ENTRY_COMPLETE',
     # NEW: cycle-ready handshake bit
     'PI_CYCLE_READY':          'TN.PI_CYCLE_READY',
+    # NEW: heartbeat bit
+    'PI_HEARTBEAT':            'TN.PI_HEARTBEAT',
     # Existing tags (from the PLC)
     'SERIAL_HOLDER':         'ZEBRA.Working_String[20]',    
     'LH_CONV':               'FIX_513D.Conv_Barcode.EXTRACT[2]',
@@ -330,6 +332,8 @@ FAST_POLL_INTERVAL = 0.25   # fast polling for fail/datastore
 RETRY_DELAY        = 1    # seconds to wait before first retry
 MAX_RETRY_DELAY    = 5    # maximum seconds to back off on repeated errors
 RESET_BACKOFF_TIMEOUT = 60  # seconds of stability to reset retry delay
+# Heartbeat period (seconds between state changes)
+HEARTBEAT_PERIOD_S = 2.0
 
 # --- USB health & formatting helpers ---
 
@@ -905,6 +909,21 @@ def time_sync_worker(plc: LogixDriver) -> None:
             logger.exception("Time sync worker error")
         time.sleep(TIME_SYNC_INTERVAL_S)
 
+def heartbeat_worker(plc: LogixDriver, period_s: float = HEARTBEAT_PERIOD_S) -> None:
+    """
+    Toggle PI_HEARTBEAT True/False with a fixed interval between state changes.
+    """
+    state = False
+    while True:
+        try:
+            plc.write((PLC_TAGS['PI_HEARTBEAT'], state))
+            state = not state
+        except CommError as e:
+            logger.debug("Heartbeat write CommError: %s", e)
+        except Exception:
+            logger.exception("Heartbeat write error")
+        time.sleep(period_s)
+
 def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
 
      # create a persistent driver and open session once
@@ -923,6 +942,8 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
             threading.Thread(target=time_sync_worker, args=(plc,), daemon=True).start()
             # also do an immediate one-shot sync at startup
             sync_pi_time_once(plc)
+        # Start heartbeat thread
+        threading.Thread(target=heartbeat_worker, args=(plc,), daemon=True).start()
     except Exception as e:
         logger.error("Initial PLC open failed: %s", e)
     logger.info("Entering monitor_and_update with PLC=%s, DB=%s", plc_ip_address, db_file)

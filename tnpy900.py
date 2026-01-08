@@ -972,9 +972,9 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
             while True:
                 # clear pass/fail and TLA flags on sequence reset
                 seq_val = plc.read(PLC_TAGS['SEQ_STEP']).value
-                if seq_val == 0:
-                    # Hold PLC at step 0 until all resets succeed
-                    plc.write((PLC_TAGS['PI_CYCLE_READY'], False))
+                if seq_val == 5:
+                    # Perform the write-and-verify handshake at Step 5
+                    write_plc_message(plc, "PI handshake (Step 5): preparing system…")
 
                     ok = True
                     ok &= write_and_verify(plc, PLC_TAGS['TN_CHECK_PASS'], False)
@@ -987,10 +987,13 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                     ok &= write_and_verify(plc, PLC_TAGS['TN_MESSAGE'], "")
 
                     if ok:
+                        # Latch ready HIGH; PLC will OTU at step 10
                         plc.write((PLC_TAGS['PI_CYCLE_READY'], True))
-                        logger.debug("PI_CYCLE_READY set True; PLC may advance from step 0")
+                        logger.info("Step 5: PI_CYCLE_READY set True; PLC may advance")
+                        write_plc_message(plc, "PI handshake complete")
                     else:
-                        logger.error("Reset handshake failed; PI_CYCLE_READY remains False")
+                        logger.error("Reset handshake failed at Step 5; waiting to retry")
+                        write_plc_message(plc, "PI handshake (Step 5): retrying…")
 
                     # reset per-cycle flags
                     leak_logged_normal = False

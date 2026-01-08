@@ -817,6 +817,27 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
     except Exception:
         logger.exception("handle_fail encountered an error")
 
+def set_ready_true_with_retry(plc: LogixDriver) -> None:
+    """
+    At SEQ_STEP 5, assert TN.PI_CYCLE_READY True and keep retrying until the readback is True
+    or the PLC leaves step 5. Never writes False.
+    """
+    last_info = 0.0
+    while True:
+        rs = plc.read(PLC_TAGS['SEQ_STEP'])
+        if not rs or rs.value != 5:
+            return
+        rb = plc.read(PLC_TAGS['PI_CYCLE_READY'])
+        if rb and getattr(rb, 'error', None) is None and rb.value:
+            return
+        ok = write_and_verify(plc, PLC_TAGS['PI_CYCLE_READY'], True)
+        if ok:
+            logger.info("Step 5: PI_CYCLE_READY confirmed True")
+            return
+        if time.time() - last_info > 2.0:
+            logger.error("Step 5: PI_CYCLE_READY write failed; retrying")
+            last_info = time.time()
+        time.sleep(POLL_INTERVAL)
 
 # Time sync settings
 TIME_SYNC_ENABLED = True          # turn off if not desired
@@ -924,20 +945,14 @@ def time_sync_worker(plc: LogixDriver) -> None:
 def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
 
      # create a persistent driver and open session once
-    # set a very long timeout (disable practical CIP timeout)
     plc = LogixDriver(plc_ip_address, timeout=86400.0)
     try:
         plc.open()
-        # disable OS-level socket timeouts
-        plc._cli.socket.settimeout(None)
         logger.info("PLC connection established.")
         globals()['plc'] = plc
-        # Startup self-test for TN.Message
         self_test_tn_message(plc)
-        # Start PLC→Pi time sync thread
         if TIME_SYNC_ENABLED:
             threading.Thread(target=time_sync_worker, args=(plc,), daemon=True).start()
-            # also do an immediate one-shot sync at startup
             sync_pi_time_once(plc)
     except Exception as e:
         logger.error("Initial PLC open failed: %s", e)
@@ -973,32 +988,21 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                 # clear pass/fail and TLA flags on sequence reset
                 seq_val = plc.read(PLC_TAGS['SEQ_STEP']).value
                 if seq_val == 5:
-                    # Perform the write-and-verify handshake at Step 5
-                    write_plc_message(plc, "PI handshake (Step 5): preparing system…")
 
                     ok = True
                     ok &= write_and_verify(plc, PLC_TAGS['TN_CHECK_PASS'], False)
                     ok &= write_and_verify(plc, PLC_TAGS['TN_CHECK_FAIL'], False)
                     ok &= write_and_verify(plc, PLC_TAGS['TN_TLA_SN_CHECK_PASS'], False)
                     ok &= write_and_verify(plc, PLC_TAGS['SERIAL_DB_ENTRY_COMPLETE'], False)
-                    ok &= write_and_verify(plc, PLC_TAGS['REWORK_LABEL_FINISHED'], "")
-                    ok &= write_and_verify(plc, PLC_TAGS['TN_MANUAL_ENTRY'], "")
                     ok &= write_and_verify(plc, PLC_TAGS['ALLOW_MULTIPLE_REWORK'], False)
-                    ok &= write_and_verify(plc, PLC_TAGS['TN_MESSAGE'], "")
 
                     if ok:
-                        # Latch ready HIGH; PLC will OTU at step 10
-                        plc.write((PLC_TAGS['PI_CYCLE_READY'], True))
-                        logger.info("Step 5: PI_CYCLE_READY set True; PLC may advance")
-                        write_plc_message(plc, "PI handshake complete")
+                        set_ready_true_with_retry(plc)  # keep retrying until latched
                     else:
                         logger.error("Reset handshake failed at Step 5; waiting to retry")
-                        write_plc_message(plc, "PI handshake (Step 5): retrying…")
 
-                    # reset per-cycle flags
-                    leak_logged_normal = False
-                    leak_logged_fpc = False
-                    leak_logged_rework = False
+                    # per-cycle resets
+                    leak_logged_normal = leak_logged_fpc = leak_logged_rework = False
                     scan_consumed = False
                     tla_signal_sent = False
                     continue

@@ -181,22 +181,6 @@ def extract_julian(serial: Any) -> str:
     """
     s = str(serial or "")
     return s[2:7] if len(s) >= 7 else ""
-
-def write_and_verify(plc: LogixDriver, tag: str, value: Any) -> bool:
-    """Write a tag and verify by reading it back."""
-    try:
-        wr = plc.write((tag, value))
-        if not wr or getattr(wr, 'error', None):
-            logger.error("Write failed: %s -> %r | err=%s", tag, value, getattr(wr, 'error', None))
-            return False
-        rb = plc.read(tag)
-        ok = rb and getattr(rb, 'error', None) is None and rb.value == value
-        if not ok:
-            logger.error("Readback mismatch: %s expected=%r got=%r", tag, value, rb.value if rb else None)
-        return ok
-    except Exception:
-        logger.exception("write_and_verify error for %s", tag)
-        return False
     
 def extract_tla_from_barcode(barcode: Any, start_char_1_based: int = 47, length: int = 17) -> Optional[str]:
     """
@@ -817,27 +801,6 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
     except Exception:
         logger.exception("handle_fail encountered an error")
 
-def set_ready_true_with_retry(plc: LogixDriver) -> None:
-    """
-    At SEQ_STEP 5, assert TN.PI_CYCLE_READY True and keep retrying until the readback is True
-    or the PLC leaves step 5. Never writes False.
-    """
-    last_info = 0.0
-    while True:
-        rs = plc.read(PLC_TAGS['SEQ_STEP'])
-        if not rs or rs.value != 5:
-            return
-        rb = plc.read(PLC_TAGS['PI_CYCLE_READY'])
-        if rb and getattr(rb, 'error', None) is None and rb.value:
-            return
-        ok = write_and_verify(plc, PLC_TAGS['PI_CYCLE_READY'], True)
-        if ok:
-            logger.info("Step 5: PI_CYCLE_READY confirmed True")
-            return
-        if time.time() - last_info > 2.0:
-            logger.error("Step 5: PI_CYCLE_READY write failed; retrying")
-            last_info = time.time()
-        time.sleep(POLL_INTERVAL)
 
 # Time sync settings
 TIME_SYNC_ENABLED = True          # turn off if not desired
@@ -945,14 +908,20 @@ def time_sync_worker(plc: LogixDriver) -> None:
 def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
 
      # create a persistent driver and open session once
+    # set a very long timeout (disable practical CIP timeout)
     plc = LogixDriver(plc_ip_address, timeout=86400.0)
     try:
         plc.open()
+        # disable OS-level socket timeouts
+        plc._cli.socket.settimeout(None)
         logger.info("PLC connection established.")
         globals()['plc'] = plc
+        # Startup self-test for TN.Message
         self_test_tn_message(plc)
+        # Start PLC→Pi time sync thread
         if TIME_SYNC_ENABLED:
             threading.Thread(target=time_sync_worker, args=(plc,), daemon=True).start()
+            # also do an immediate one-shot sync at startup
             sync_pi_time_once(plc)
     except Exception as e:
         logger.error("Initial PLC open failed: %s", e)
@@ -987,22 +956,16 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
             while True:
                 # clear pass/fail and TLA flags on sequence reset
                 seq_val = plc.read(PLC_TAGS['SEQ_STEP']).value
-                if seq_val == 5:
-
-                    ok = True
-                    ok &= write_and_verify(plc, PLC_TAGS['TN_CHECK_PASS'], False)
-                    ok &= write_and_verify(plc, PLC_TAGS['TN_CHECK_FAIL'], False)
-                    ok &= write_and_verify(plc, PLC_TAGS['TN_TLA_SN_CHECK_PASS'], False)
-                    ok &= write_and_verify(plc, PLC_TAGS['SERIAL_DB_ENTRY_COMPLETE'], False)
-                    ok &= write_and_verify(plc, PLC_TAGS['ALLOW_MULTIPLE_REWORK'], False)
-
-                    if ok:
-                        set_ready_true_with_retry(plc)  # keep retrying until latched
-                    else:
-                        logger.error("Reset handshake failed at Step 5; waiting to retry")
-
-                    # per-cycle resets
-                    leak_logged_normal = leak_logged_fpc = leak_logged_rework = False
+                if seq_val == 0:
+                    plc.write((PLC_TAGS['TN_CHECK_PASS'], False))
+                    plc.write((PLC_TAGS['TN_CHECK_FAIL'], False))
+                    plc.write((PLC_TAGS['TN_TLA_SN_CHECK_PASS'], False))
+                    plc.write((PLC_TAGS['SERIAL_DB_ENTRY_COMPLETE'], False))
+                    plc.write((PLC_TAGS['ALLOW_MULTIPLE_REWORK'], False))
+                    # reset per-cycle flags
+                    leak_logged_normal = False
+                    leak_logged_fpc = False
+                    leak_logged_rework = False
                     scan_consumed = False
                     tla_signal_sent = False
                     continue

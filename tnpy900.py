@@ -160,6 +160,7 @@ PLC_TAGS = {
     'LABEL_FAULT':           'FIX_513D.Label_Barcode.FAULT_TIMER.DN',
     'PART_SELECT':           'FIX_513D.Part_Select',
     'SERIAL_NUMBER':         'FIX_513D.Serial_Number',
+    'SHIFT_NUMBER':          'ZEBRA.Shift_Int',
     # Rework extensions
     'ALLOW_MULTIPLE_REWORK': 'ALLOW_MULTIPLE_REWORK',
     'FORCE_REWORK_INPUT':    'I1.Data.15',
@@ -648,11 +649,11 @@ def ensure_unique_finished_serial(plc: LogixDriver, cursor: sqlite3.Cursor, max_
                 return tla_sn
 
             # Duplicate, increment PLC serial number for current part selection
-            current_sn_num = plc.read(f"{PLC_TAGS['SERIAL_NUMBER']}[1]").value or 0
+            current_sn_num = plc.read(f"{PLC_TAGS['SERIAL_NUMBER']}[SHIFT_NUMBER]").value or 0
             next_sn_num = current_sn_num + 1
-            plc.write((f"{PLC_TAGS['SERIAL_NUMBER']}[1]", next_sn_num))
+            plc.write((f"{PLC_TAGS['SERIAL_NUMBER']}[SHIFT_NUMBER]", next_sn_num))
             # log fix: remove undefined part_select var
-            logger.info("TLA duplicate detected for %s; incremented SERIAL_NUMBER[1] to %s (attempt %d)",
+            logger.info("TLA duplicate detected for %s; incremented SERIAL_NUMBER[SHIFT_NUMBER] to %s (attempt %d)",
                         tla_sn, next_sn_num, attempt)
             time.sleep(sleep_s)
 

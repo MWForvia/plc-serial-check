@@ -1127,7 +1127,6 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                 # 2) Rework Mode
                 rework = plc.read(PLC_TAGS['REWORK_MODE'])
                 if rework and rework.value:
-                    ts = time.strftime('%Y-%m-%d %H:%M:%S')
                     if not lhconv or not rhconv:
                         set_pass(plc, False)
                         logger.error("Rework inputs invalid: LH=%s, RH=%s", lhconv, rhconv)

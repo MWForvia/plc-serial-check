@@ -949,10 +949,19 @@ def heartbeat_worker(plc: LogixDriver, period_s: float = HEARTBEAT_PERIOD_S) -> 
     """
     Toggle PI_HEARTBEAT True/False with a fixed interval between state changes.
     """
+    tag = PLC_TAGS.get('PI_HEARTBEAT')
+    if not tag:
+        logger.error("Heartbeat tag not configured")
+        return
     state = False
     while True:
         try:
-            plc.write((PLC_TAGS['PI_HEARTBEAT'], state))
+            wr = plc.write((tag, bool(state)))
+            if not wr or getattr(wr, 'error', None):
+                logger.debug("Heartbeat write failed: %r", wr)
+            # optional debug read-back
+            rb = plc.read(tag)
+            logger.debug("Heartbeat %s -> PLC=%s", state, getattr(rb, 'value', None))
             state = not state
         except CommError as e:
             logger.debug("Heartbeat write CommError: %s", e)

@@ -993,6 +993,7 @@ def heartbeat_worker(plc: LogixDriver, period_s: float = HEARTBEAT_PERIOD_S) -> 
 def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
     # ...existing code...
     try:
+        plc = LogixDriver(plc_ip_address)  # create the driver
         plc.open()
         plc._cli.socket.settimeout(None)
         logger.info("PLC connection established.")

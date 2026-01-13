@@ -144,7 +144,7 @@ PLC_TAGS = {
     # NEW: cycle-ready handshake bit
     'PI_CYCLE_READY':          'TN.PI_CYCLE_READY',
     # NEW: heartbeat bit
-    'PI_HEARTBEAT':            'TN.PI_HEARTBEAT',
+    'PI_HEARTBEAT':            'RPI_HEARTBEAT',
     # Existing tags (from the PLC)
     'SERIAL_HOLDER':         'ZEBRA.Working_String[20]',    
     'LH_CONV':               'FIX_513D.Conv_Barcode.EXTRACT[2]',
@@ -717,7 +717,7 @@ def replicate_tn_to_backups(timestamp: str, finished_serial: Any, finished_seria
                             lhconv: Any, lhconv_date: Any, rhconv: Any, rhconv_date: Any, status: str) -> None:
     """
     Write the same TN record into the USB backup databases only.
-    The local DB is already written by the caller; avoid duplicating it here.
+    The local DB is already written by the caller;
     """
     for dbp in [USB_DB_BACKUP, USB_DB_BACKUP2]:
         try:
@@ -747,7 +747,7 @@ def record_and_signal_failure(plc: LogixDriver, cursor: sqlite3.Cursor,
         if seq and seq.value == 89:
             return  # Already in fail step; do nothing
 
-        ts = time.strftime('%Y-%m-%d %H:%M:%S')
+        ts = get_plc_timestamp(plc)
         fs = finished_serial or 'N/A'
         fs_date = extract_julian(fs)
         lh = lhconv or 'N/A'
@@ -843,26 +843,36 @@ def _plc_time_to_datetime(vals: list) -> Optional[datetime]:
     try:
         y, M, d, h, m, s, us = (int(vals[0]), int(vals[1]), int(vals[2]),
                                 int(vals[3]), int(vals[4]), int(vals[5]), int(vals[6]))
-        # clamp microseconds to valid range
         us = max(0, min(us, 999999))
         return datetime(y, M, d, h, m, s, us)
     except Exception:
         logger.exception("Invalid PLC time array: %r", vals)
         return None
 
+# NEW: ensure system timezone (once)
+def ensure_system_timezone(tz: str = "America/Chicago") -> None:
+    try:
+        r = subprocess.run(
+            ["timedatectl", "show", "-p", "Timezone", "--value"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        current = (r.stdout or "").strip()
+        if current != tz:
+            subprocess.run(
+                ["sudo", "-n", "timedatectl", "set-timezone", tz],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+    except Exception:
+        logger.exception("ensure_system_timezone failed")
+
+# NEW: set Pi time from a local datetime
 def _set_pi_time(dt_local: datetime) -> bool:
-    """
-    Set system time using timedatectl. Returns True on success.
-    Requires service to run as root or sudo NOPASSWD for timedatectl.
-    """
     try:
         ts = dt_local.strftime("%Y-%m-%d %H:%M:%S")
-        # First try directly
         r = subprocess.run(["sudo", "-n", "timedatectl", "set-time", ts],
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if r.returncode == 0:
             return True
-        # If NTP blocks manual set, disable then set
         subprocess.run(["sudo", "-n", "timedatectl", "set-ntp", "false"],
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         r2 = subprocess.run(["sudo", "-n", "timedatectl", "set-time", ts],
@@ -874,6 +884,31 @@ def _set_pi_time(dt_local: datetime) -> bool:
     except Exception:
         logger.exception("Failed to set system time via timedatectl")
         return False
+
+# NEW: one-shot PLC->Pi time sync
+def sync_pi_time_once(plc: LogixDriver) -> None:
+    try:
+        vals = _plc_time_array(plc)
+        if not vals:
+            return
+        plc_dt = _plc_time_to_datetime(vals)
+        if not plc_dt:
+            return
+        _set_pi_time(plc_dt)
+    except Exception:
+        logger.exception("sync_pi_time_once failed")
+
+# NEW: get PLC timestamp string with safe fallback to Pi time
+def get_plc_timestamp(plc: LogixDriver) -> str:
+    try:
+        vals = _plc_time_array(plc)
+        if vals:
+            dt = _plc_time_to_datetime(vals)
+            if dt:
+                return dt.strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        logger.exception("get_plc_timestamp failed; falling back to Pi time")
+    return time.strftime('%Y-%m-%d %H:%M:%S')
 
 def sync_pi_time_once(plc: LogixDriver) -> None:
     """
@@ -932,10 +967,12 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
     plc = LogixDriver(plc_ip_address, timeout=86400.0)
     try:
         plc.open()
-        # disable OS-level socket timeouts
         plc._cli.socket.settimeout(None)
         logger.info("PLC connection established.")
         globals()['plc'] = plc
+        # One-time TZ check and one-shot PLC->Pi time sync
+        ensure_system_timezone()
+        sync_pi_time_once(plc)
         # Startup self-test for TN.Message
         self_test_tn_message(plc)
         # Start PLC→Pi time sync thread
@@ -1044,7 +1081,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             if fpc_tla_sn and not tla_signal_sent:
                                 tla_signal_sent = True
                         if rs and rs.value == 160 and fpc_tla_sn and not fpc_insert_done:
-                            ts = time.strftime('%Y-%m-%d %H:%M:%S')
+                            ts = get_plc_timestamp(plc)
                             cursor.execute(SQL_STATEMENTS['insert_tn'],
                                            (ts,
                                             fpc_tla_sn,
@@ -1063,7 +1100,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         time.sleep(POLL_INTERVAL)
                     continue
 
-                # 1) Leak-test rerun logic removed entirely
+                # 1) Leak-test rerun logic removed
 
                 # 2) Rework Mode
                 rework = plc.read(PLC_TAGS['REWORK_MODE'])
@@ -1148,7 +1185,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                     if not rework_tla_sn:
                                         logger.error("Skipping Rework DB insert: no TLA at 160")
                                         break
-                                    ts = time.strftime('%Y-%m-%d %H:%M:%S')  # moved here
+                                    ts = get_plc_timestamp(plc)  # PLC-based timestamp
                                     status_text = f"Rework Pass <{prev_tla}> => <{rework_tla_sn}>" if prev_tla else f"Rework Pass => <{rework_tla_sn}>"
                                     cursor.execute(
                                         SQL_STATEMENTS['insert_tn'],
@@ -1203,7 +1240,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             if tla_sn and not tla_signal_sent:
                                 tla_signal_sent = True
                         if rs and rs.value == 160:
-                            ts = time.strftime('%Y-%m-%d %H:%M:%S')
+                            ts = get_plc_timestamp(plc)
                             cursor.execute(
                                 SQL_STATEMENTS['insert_tn'],
                                 (ts, tla_sn, extract_julian(tla_sn), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Passed')

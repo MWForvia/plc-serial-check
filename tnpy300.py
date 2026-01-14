@@ -839,8 +839,7 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                     if seq_val != 20:
                         time.sleep(FAST_POLL_INTERVAL)
                         continue
-                    # Detect mode and wait for scan to be active (level-detect)
-                    rework_mode = bool(read_tag(plc, PLC_TAGS['REWORK_MODE']))
+                    # Wait for scan to be active (level-detect)
                     # Wait until SCAN_COMPLETE is true, but abort immediately on reset (SEQ_STEP==10)
                     _aborted = False
                     while True:
@@ -853,6 +852,11 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         time.sleep(POLL_INTERVAL)
                     if _aborted:
                         continue
+
+                    # Read mode at the moment we evaluate the scan. (Operators/PLC may assert REWORK_MODE
+                    # after we enter SEQ_STEP 20; reading it only once earlier can miss that.)
+                    rework_mode = bool(read_tag(plc, PLC_TAGS['REWORK_MODE']))
+                    logger.info("EVAL MODE: rework_mode=%s", rework_mode)
 
                     # Read serials safely
                     tla1 = (read_tag(plc, PLC_TAGS['TLA1']) or '').strip()
@@ -870,7 +874,11 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         ("TLA2", tla2),
                         ("CONV2", conv2),
                     ]
-                    logger.info("SERIALS CHECKED: " + ", ".join(f"{label}={sn}" for label, sn in serials))
+                    logger.info(
+                        "SERIALS CHECKED (rework_mode=%s): %s",
+                        rework_mode,
+                        ", ".join(f"{label}={sn}" for label, sn in serials),
+                    )
 
                     if rework_mode:
                         # Rework requirements (simplified):

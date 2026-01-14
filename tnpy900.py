@@ -26,7 +26,7 @@ import time
 import os
 from pathlib import Path
 from typing import Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 import errno
 import json
 import socket
@@ -176,32 +176,137 @@ SQL_STATEMENTS = {
     )
 }
 
+def _is_real_serial(s: str) -> bool:
+    s = (s or "").strip()
+    if not s:
+        return False
+    if s.upper() in ("N/A", "NA", "NONE"):
+        return False
+    return True
+
+def normalize_serial(serial: Any) -> str:
+    """
+    Force real serials to start with 'T' for consistent storage/search.
+    Leaves placeholders (N/A/empty) unchanged.
+    """
+    s = str(serial or "").strip()
+    if not _is_real_serial(s):
+        return s
+    if s[:1].upper() == "T":
+        return "T" + s[1:]
+    return "T" + s
+
 def extract_julian(serial: Any) -> str:
     """
-    Extract 5-digit Julian date from serial (chars 2-6), or empty string if invalid.
+    Extract 5-digit Julian date from normalized serials.
+    Example: T1126014 -> 26014 (slice index 3..7)
     """
-    s = str(serial or "")
-    return s[2:7] if len(s) >= 7 else ""
-    
-def extract_tla_from_barcode(barcode: Any, start_char_1_based: int = 47, length: int = 17) -> Optional[str]:
+    s = normalize_serial(serial)
+    if len(s) >= 8 and s[:1].upper() == "T":
+        return s[3:8]
+    return ""
+
+
+def migrate_db_serial_normalization_once(db_path: str) -> None:
     """
-    Extract the TLA serial from a full barcode string.
-    By requirement: take 17 characters starting with character 47 (1-based indexing) of the barcode.
-    Returns None if the barcode is too short.
+    One-time migration using PRAGMA user_version:
+      - Prefix finished and converter serial columns with 'T'
+      - Fix julian *_date columns to match the normalized format
     """
+    if db_path.startswith("/media") and not is_mounted(db_path):
+        return
+
     try:
-        s = str(barcode or "")
-        start_idx = max(0, (start_char_1_based - 1))  # convert to 0-based
-        end_idx = start_idx + max(0, length)
-        if len(s) >= end_idx:
-            tla = s[start_idx:end_idx]
-            logger.info("Extracted TLA from barcode: start=%d length=%d total_len=%d -> %r", start_char_1_based, length, len(s), tla)
-            return tla
-        logger.error("Barcode too short to extract TLA: needed end_idx=%d, got len=%d; barcode=%r", end_idx, len(s), s)
-        return None
+        with get_db_connection(db_path, timeout=10) as conn:
+            cur = conn.cursor()
+            cur.execute("PRAGMA user_version;")
+            user_ver = int(cur.fetchone()[0] or 0)
+
+            TARGET_VER = 1
+            if user_ver >= TARGET_VER:
+                return
+
+            # Prefix finished serials (defensive: should normally already start with 'T')
+            cur.execute(
+                """
+                UPDATE tn
+                SET finished_serial = 'T' || finished_serial
+                WHERE finished_serial IS NOT NULL
+                  AND trim(finished_serial) != ''
+                  AND upper(finished_serial) NOT LIKE 'T%'
+                  AND upper(finished_serial) NOT IN ('N/A','NA','NONE')
+                """
+            )
+
+            # Prefix converter serials
+            cur.execute(
+                """
+                UPDATE tn
+                SET component_serial1 = 'T' || component_serial1
+                WHERE component_serial1 IS NOT NULL
+                  AND trim(component_serial1) != ''
+                  AND upper(component_serial1) NOT LIKE 'T%'
+                  AND upper(component_serial1) NOT IN ('N/A','NA','NONE')
+                """
+            )
+
+            cur.execute(
+                """
+                UPDATE tn
+                SET component_serial2 = 'T' || component_serial2
+                WHERE component_serial2 IS NOT NULL
+                  AND trim(component_serial2) != ''
+                  AND upper(component_serial2) NOT LIKE 'T%'
+                  AND upper(component_serial2) NOT IN ('N/A','NA','NONE')
+                """
+            )
+
+            # Fix julian dates (now always from char 4, len 5 for normalized 'Txxxxxxx')
+            cur.execute(
+                """
+                UPDATE tn
+                SET finished_serial_date = substr(finished_serial, 4, 5)
+                WHERE finished_serial IS NOT NULL
+                  AND upper(finished_serial) LIKE 'T%'
+                  AND length(finished_serial) >= 8
+                  AND (finished_serial_date IS NULL OR finished_serial_date != substr(finished_serial, 4, 5))
+                """
+            )
+
+            cur.execute(
+                """
+                UPDATE tn
+                SET component_serial1_date = substr(component_serial1, 4, 5)
+                WHERE component_serial1 IS NOT NULL
+                  AND upper(component_serial1) LIKE 'T%'
+                  AND length(component_serial1) >= 8
+                  AND (component_serial1_date IS NULL OR component_serial1_date != substr(component_serial1, 4, 5))
+                """
+            )
+
+            cur.execute(
+                """
+                UPDATE tn
+                SET component_serial2_date = substr(component_serial2, 4, 5)
+                WHERE component_serial2 IS NOT NULL
+                  AND upper(component_serial2) LIKE 'T%'
+                  AND length(component_serial2) >= 8
+                  AND (component_serial2_date IS NULL OR component_serial2_date != substr(component_serial2, 4, 5))
+                """
+            )
+
+            cur.execute(f"PRAGMA user_version = {TARGET_VER};")
+            conn.commit()
+
+            try:
+                cur.execute("ANALYZE;")
+                conn.commit()
+            except Exception:
+                pass
+
+            logger.info("DB migration complete (user_version=%d) for %s", TARGET_VER, db_path)
     except Exception:
-        logger.exception("Failed to extract TLA from barcode")
-        return None
+        logger.exception("DB migration failed for %s", db_path)
 
 # Detailed DB error info codes for TN.DB_ERROR_INFO
 DB_ERROR_INFO_CODES = {
@@ -340,7 +445,6 @@ def sync_db_from_backup(local_db: str) -> None:
     """
     Incremental tri-directional sync: pick the DB with most rows then append missing rows to the others.
     """
-    # show all DB paths being used for syncing for diagnostics
     logger.debug("Sync targets: local=%s, usb1=%s, usb2=%s", local_db, USB_DB_BACKUP, USB_DB_BACKUP2)
     logger.debug("Entered sync_db_from_backup")
     paths = {
@@ -349,20 +453,17 @@ def sync_db_from_backup(local_db: str) -> None:
         'usb2':  USB_DB_BACKUP2,
     }
     logger.debug("Entering sync_db_from_backup with local_db=%s", local_db)
-    # compute max id in each accessible DB
+
     row_ids = {}
     for name, path in paths.items():
         logger.debug("Scanning DB %s at %s", name, path)
-        # for USB targets, require parent dir and mount before proceeding
         if path.startswith("/media"):
-            # determine the actual mount root, e.g. '/media/usbdrive'
             mount_root = os.path.dirname(os.path.dirname(path))
-            # skip entire USB if not mounted
             if not is_mounted(mount_root):
                 logger.debug("Skipping read for %s: mount %s not present", name, mount_root)
                 row_ids[name] = -1
                 continue
-            # ensure backup directory exists under the mounted device
+
             parent = os.path.dirname(path)
             try:
                 os.makedirs(parent, exist_ok=True)
@@ -371,45 +472,19 @@ def sync_db_from_backup(local_db: str) -> None:
                     logger.debug("Skipping read for %s: cannot create directory %s (%s)", name, parent, e)
                     row_ids[name] = -1
                     continue
-                else:
-                    logger.exception("Error creating directory %s for %s", parent, name)
-                    row_ids[name] = -1
-                    continue
-            # if DB file is missing, initialize new DB with schema
+                logger.exception("Error creating directory %s for %s", parent, name)
+                row_ids[name] = -1
+                continue
+
             if not os.path.exists(path):
                 try:
-                    with get_db_connection(path, timeout=1) as init_conn:
-                        init_conn.execute(
-                            """
-                            CREATE TABLE IF NOT EXISTS tn (
-                                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                date TEXT,
-                                finished_serial TEXT,
-                                finished_serial_date TEXT,
-                                component_serial1 TEXT,
-                                component_serial1_date TEXT,
-                                component_serial2 TEXT,
-                                component_serial2_date TEXT,
-                                status TEXT
-                            )
-                            """
-                        )
-                        init_conn.commit()
-                        # create indexes on new backup DB
-                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished ON tn(finished_serial);")
-                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished_date ON tn(finished_serial_date);")
-                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished_date_serial ON tn(finished_serial_date, finished_serial);")
-                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component1_date ON tn(component_serial1_date);")
-                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component1_date_serial ON tn(component_serial1_date, component_serial1);")
-                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component2_date ON tn(component_serial2_date);")
-                        init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component2_date_serial ON tn(component_serial2_date, component_serial2);")
-                        init_conn.commit()
-                        logger.debug("Created and initialized new backup DB at %s", path)
+                    ensure_db_schema(path)
+                    logger.debug("Created and initialized new backup DB at %s", path)
                 except Exception:
                     row_ids[name] = -1
                     logger.exception("Failed to initialize DB at %s", path)
                     continue
-        # attempt to read max id
+
         try:
             with get_db_connection(path, timeout=1) as conn:
                 row_ids[name] = conn.execute("SELECT MAX(id) FROM tn").fetchone()[0] or 0
@@ -417,42 +492,39 @@ def sync_db_from_backup(local_db: str) -> None:
         except Exception:
             row_ids[name] = -1
             logger.exception("Unable to read DB at %s", path)
+
     if all(val < 0 for val in row_ids.values()):
         logger.warning("No accessible database files to sync: %s", paths)
         logger.info("Exiting sync_db_from_backup without action")
         return
-    # choose source with highest max id
-    source = max(row_ids, key=row_ids.get)       
+
+    source = max(row_ids, key=row_ids.get)
     src_path = paths[source]
-    # incremental append to others
+
     for name, tgt_path in paths.items():
         if name == source:
             continue
-        if tgt_path.startswith("/media") and not is_mounted(tgt_path):
-            logger.debug("Skipping sync to unmounted %s", tgt_path)
-            continue
+
+        if tgt_path.startswith("/media"):
+            mount_root = os.path.dirname(os.path.dirname(tgt_path))
+            if not is_mounted(mount_root):
+                logger.debug("Skipping sync to unmounted %s (mount %s not present)", tgt_path, mount_root)
+                continue
+
         tgt_dir = os.path.dirname(tgt_path) or "."
         try:
             os.makedirs(tgt_dir, exist_ok=True)
         except OSError as e:
-            # skip backend if USB path not available
             if e.errno in (errno.ENODEV, errno.ENOENT):
                 logger.debug("Skipping sync to %s: cannot create directory %s (%s)", tgt_path, tgt_dir, e)
                 continue
-            else:
-                logger.exception("Error creating directory %s for %s", tgt_dir, tgt_path)
-                continue
-            with sqlite3.connect(tgt_path) as tgt_conn:
-                tgt_cur = tgt_conn.cursor()
-                tgt_cur.execute(
-                    "CREATE TABLE IF NOT EXISTS tn ("
-                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                    "date TEXT, finished_serial TEXT, finished_serial_date TEXT, "
-                    "component_serial1 TEXT, component_serial1_date TEXT, "
-                    "component_serial2 TEXT, component_serial2_date TEXT, status TEXT)"
-                )
-                tgt_cur.execute("SELECT MAX(id) FROM tn")
-                max_id = tgt_cur.fetchone()[0] or 0
+            logger.exception("Error creating directory %s for %s", tgt_dir, tgt_path)
+            continue
+
+        try:
+            ensure_db_schema(tgt_path)
+            with get_db_connection(tgt_path, timeout=5) as tgt_conn:
+                max_id = tgt_conn.execute("SELECT MAX(id) FROM tn").fetchone()[0] or 0
                 tgt_conn.execute("ATTACH DATABASE ? AS src", (src_path,))
                 new_count = tgt_conn.execute(
                     "SELECT COUNT(*) FROM src.tn WHERE id > ?", (max_id,)
@@ -470,72 +542,8 @@ def sync_db_from_backup(local_db: str) -> None:
                 tgt_conn.execute("DETACH DATABASE src")
         except Exception:
             logger.exception("Failed incremental sync from %s to %s", src_path, tgt_path)
+
     logger.debug("Exiting sync_db_from_backup")
-
-
-def sync_local_to_target(local_db: str, target_db: str) -> None:
-    """
-    One-way sync: append new rows from local_db into target_db.
-    """
-    # require mount
-    if not is_mounted(target_db):
-        logger.debug("Target %s not mounted, skipping one-way sync", target_db)
-        return
-    # ensure directory and schema
-    parent = os.path.dirname(target_db)
-    os.makedirs(parent, exist_ok=True)
-    if not os.path.exists(target_db):
-        try:
-            with get_db_connection(target_db, timeout=3) as init_conn:
-                init_conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS tn (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        date TEXT,
-                        finished_serial TEXT,
-                        finished_serial_date TEXT,
-                        component_serial1 TEXT,
-                        component_serial1_date TEXT,
-                        component_serial2 TEXT,
-                        component_serial2_date TEXT,
-                        status TEXT
-                    )
-                    """
-                )
-                init_conn.commit()
-                # Ensure indexes used by lookups exist on fresh targets
-                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished_date ON tn(finished_serial_date);")
-                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_finished_date_serial ON tn(finished_serial_date, finished_serial);")
-                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component1_date ON tn(component_serial1_date);")
-                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component1_date_serial ON tn(component_serial1_date, component_serial1);")
-                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component2_date ON tn(component_serial2_date);")
-                init_conn.execute("CREATE INDEX IF NOT EXISTS idx_tn_component2_date_serial ON tn(component_serial2_date, component_serial2);")
-                init_conn.commit()
-            logger.debug("Initialized target DB for one-way sync at %s", target_db)
-        except Exception:
-            logger.exception("Failed to initialize target DB at %s", target_db)
-            return
-    # attach and insert
-    try:
-        with get_db_connection(target_db, timeout=3) as tgt_conn:
-            tgt_conn.execute("ATTACH DATABASE ? AS src", (local_db,))
-            max_id = tgt_conn.execute("SELECT MAX(id) FROM tn").fetchone()[0] or 0
-            new_count = tgt_conn.execute(
-                "SELECT COUNT(*) FROM src.tn WHERE id > ?", (max_id,)
-            ).fetchone()[0]
-            if new_count > 0:
-                tgt_conn.execute(
-                    "INSERT INTO tn(date, finished_serial, finished_serial_date, component_serial1, component_serial1_date, "
-                    "component_serial2, component_serial2_date, status) "
-                    "SELECT date, finished_serial, finished_serial_date, component_serial1, component_serial1_date, "
-                    "component_serial2, component_serial2_date, status "
-                    "FROM src.tn WHERE id > ?", (max_id,)
-                )
-                tgt_conn.commit()
-                logger.info("Auto-synced %d new rows from %s to %s", new_count, local_db, target_db)
-            tgt_conn.execute("DETACH DATABASE src")
-    except Exception:
-        logger.exception("One-way sync failed from %s to %s", local_db, target_db)
 
 
 def watch_usb_and_sync(local_db: str, usb_path: str, name: str) -> None:
@@ -561,41 +569,12 @@ def wait_for_tag(plc: LogixDriver, tag_key: str) -> None:
         time.sleep(POLL_INTERVAL)
 
 
-def wait_for_datastore_or_reset(plc: LogixDriver) -> bool:
-    """
-    Check if DATASTORE is already true or wait for it, exit on reset.
-    """
-    while True:
-        rs = plc.read(PLC_TAGS['SEQ_STEP'])
-        if rs and rs.value == 0:
-            logger.info("Cycle Reset.")
-            return False  # Exit on reset
-        ds = plc.read(PLC_TAGS['DATASTORE'])
-        if ds and ds.value:
-            return True  # Proceed if DATASTORE is already true
-        time.sleep(FAST_POLL_INTERVAL)
-
-
-def wait_for_fail_or_reset(plc: LogixDriver) -> bool:
-    """
-    Level-detect the PART_FAIL tag: return True as soon as it's observed true, or exit on reset.
-    """
-    while True:
-        rs = plc.read(PLC_TAGS['SEQ_STEP'])
-        if rs and rs.value == 0:
-            logger.info("Cycle Reset.")
-            return False
-        fl = plc.read(PLC_TAGS['PART_FAIL'])
-        if fl and fl.value:
-            return True
-        time.sleep(FAST_POLL_INTERVAL)
-
-
 def check_converter_sn(cursor: sqlite3.Cursor, column: str, sn: Any, label: str) -> bool:
-    julian_date = extract_julian(sn)
+    norm_sn = normalize_serial(sn)
+    julian_date = extract_julian(norm_sn)
     cursor.execute(
         f"SELECT 1 FROM tn WHERE {column}_date = ? AND {column} = ?",
-        (julian_date, sn)
+        (julian_date, norm_sn)
     )
     if cursor.fetchone():
         logger.warning("%s Converter SN Failed: %s", label, sn)
@@ -624,11 +603,13 @@ def ensure_unique_finished_serial(plc: LogixDriver, cursor: sqlite3.Cursor, max_
     logger.info("Called ensure_unique_finished_serial")
     try:
         for attempt in range(1, max_attempts + 1):
-            tla_sn = (plc.read(PLC_TAGS['SERIAL_HOLDER']).value or "").strip()
-            logger.info("Attempt %d: Read SERIAL_HOLDER = %r", attempt, tla_sn)
+            raw_tla = (plc.read(PLC_TAGS['SERIAL_HOLDER']).value or "").strip()
+            tla_sn = normalize_serial(raw_tla)
+            logger.info("Attempt %d: Read SERIAL_HOLDER = %r (normalized=%r)", attempt, raw_tla, tla_sn)
             if not tla_sn:
                 time.sleep(sleep_s)
                 continue
+
             date_val = extract_julian(tla_sn)
             cursor.execute(
                 "SELECT COUNT(*) FROM tn WHERE finished_serial_date = ? AND finished_serial = ?",
@@ -648,7 +629,6 @@ def ensure_unique_finished_serial(plc: LogixDriver, cursor: sqlite3.Cursor, max_
             current_sn_num = plc.read(f"{PLC_TAGS['SERIAL_NUMBER']}[SHIFT_NUMBER]").value or 0
             next_sn_num = current_sn_num + 1
             plc.write((f"{PLC_TAGS['SERIAL_NUMBER']}[SHIFT_NUMBER]", next_sn_num))
-            # log fix: remove undefined part_select var
             logger.info("TLA duplicate detected for %s; incremented SERIAL_NUMBER[SHIFT_NUMBER] to %s (attempt %d)",
                         tla_sn, next_sn_num, attempt)
             time.sleep(sleep_s)
@@ -668,25 +648,30 @@ def insert_tn_record(db_path: str, timestamp: str, finished_serial: Any,
         if not is_mounted(db_path):
             logger.debug(f"Skipping TN record write to unmounted {db_path}")
             return
-        # create parent directory if missing
         parent_dir = os.path.dirname(db_path)
         try:
             os.makedirs(parent_dir, exist_ok=True)
         except Exception as e:
             logger.error("Failed to create directory %s for USB backup DB %s: %s", parent_dir, db_path, e)
             return
+
+    # Normalize ALL serials at the point of insertion (defensive; keeps all DBs consistent)
+    fs_n = normalize_serial(finished_serial)
+    lh_n = normalize_serial(lhconv)
+    rh_n = normalize_serial(rhconv)
+
+    fs_date_n = extract_julian(fs_n)
+    lh_date_n = extract_julian(lh_n)
+    rh_date_n = extract_julian(rh_n)
+
     try:
         with get_db_connection(db_path, timeout=3) as conn2:
             cur2 = conn2.cursor()
-            cur2.execute(SQL_STATEMENTS['insert_tn'],
-                         (timestamp,
-                          finished_serial,
-                          finished_serial_date,
-                          lhconv, lhconv_date,
-                          rhconv, rhconv_date,
-                          status))
+            cur2.execute(
+                SQL_STATEMENTS['insert_tn'],
+                (timestamp, fs_n, fs_date_n, lh_n, lh_date_n, rh_n, rh_date_n, status)
+            )
             conn2.commit()
-            # clear DB error flag and detailed info on success
             try:
                 plc = globals().get('plc')
                 if plc:
@@ -699,7 +684,6 @@ def insert_tn_record(db_path: str, timestamp: str, finished_serial: Any,
     except Exception as e:
         label = "USB backup DB" if db_path.startswith("/media") else "local DB"
         logger.error("Failed to write TN record to %s %s: %s", label, db_path, e)
-        # set DB error flag and detailed info on failure
         try:
             plc = globals().get('plc')
             if plc:
@@ -746,8 +730,10 @@ def record_and_signal_failure(plc: LogixDriver, cursor: sqlite3.Cursor,
         ts = get_plc_timestamp(plc)
         fs = finished_serial or 'N/A'
         fs_date = extract_julian(fs)
-        lh = lhconv or 'N/A'
-        rh = rhconv or 'N/A'
+
+        lh = normalize_serial(lhconv or 'N/A')
+        rh = normalize_serial(rhconv or 'N/A')
+
         cursor.execute(
             SQL_STATEMENTS['insert_tn'],
             (ts, fs, fs_date, lh, extract_julian(lh), rh, extract_julian(rh), status)
@@ -775,23 +761,26 @@ def handle_fail(lh_pass: bool, rh_pass: bool, plc: LogixDriver,
         if seq and seq.value == 89:
             return  # already handled this cycle
 
+        lh_n = normalize_serial(lhconv)
+        rh_n = normalize_serial(rhconv)
+
         if not lh_pass and not rh_pass:
             base_status = "LH & RH TN Duplicate - Failed"
             cursor.execute(
                 "SELECT finished_serial FROM tn WHERE (component_serial1_date = ? AND component_serial1 = ?) OR (component_serial2_date = ? AND component_serial2 = ?) ORDER BY id ASC LIMIT 1",
-                (extract_julian(lhconv), lhconv, extract_julian(rhconv), rhconv)
+                (extract_julian(lh_n), lh_n, extract_julian(rh_n), rh_n)
             )
         elif not lh_pass:
             base_status = "LH TN Duplicate - Failed"
             cursor.execute(
                 "SELECT finished_serial FROM tn WHERE component_serial1_date = ? AND component_serial1 = ? ORDER BY id ASC LIMIT 1",
-                (extract_julian(lhconv), lhconv)
+                (extract_julian(lh_n), lh_n)
             )
         else:
             base_status = "RH TN Duplicate - Failed"
             cursor.execute(
                 "SELECT finished_serial FROM tn WHERE component_serial2_date = ? AND component_serial2 = ? ORDER BY id ASC LIMIT 1",
-                (extract_julian(rhconv), rhconv)
+                (extract_julian(rh_n), rh_n)
             )
 
         row = cursor.fetchone()
@@ -1035,6 +1024,10 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                 rhconv = results[1].value
                 fpc_val = results[2].value
 
+                # Normalize converter serials ONCE per scan and use these everywhere (lookups + inserts)
+                lhconv_n = normalize_serial(lhconv)
+                rhconv_n = normalize_serial(rhconv)
+
                 # 0) First-piece check
                 fpc = plc.read(PLC_TAGS['FIRST_PIECE_CHECK'])
                 if fpc_val:
@@ -1061,15 +1054,21 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                 tla_signal_sent = True
                         if rs and rs.value == 160 and fpc_tla_sn and not fpc_insert_done:
                             ts = get_plc_timestamp(plc)
-                            cursor.execute(SQL_STATEMENTS['insert_tn'],
-                                           (ts,
-                                            fpc_tla_sn,
-                                            extract_julian(fpc_tla_sn),
-                                            lhconv, extract_julian(lhconv),
-                                            rhconv, extract_julian(rhconv),
-                                            'First Piece Check'))
+                            cursor.execute(
+                                SQL_STATEMENTS['insert_tn'],
+                                (ts,
+                                 fpc_tla_sn, extract_julian(fpc_tla_sn),
+                                 lhconv_n, extract_julian(lhconv_n),
+                                 rhconv_n, extract_julian(rhconv_n),
+                                 'First Piece Check')
+                            )
                             conn.commit()
-                            replicate_tn_to_backups(ts, fpc_tla_sn, extract_julian(fpc_tla_sn), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'First Piece Check')
+                            replicate_tn_to_backups(
+                                ts, fpc_tla_sn, extract_julian(fpc_tla_sn),
+                                lhconv_n, extract_julian(lhconv_n),
+                                rhconv_n, extract_julian(rhconv_n),
+                                'First Piece Check'
+                            )
                             logger.info("Data stored in local database (First Piece Check)")
                             logger.info("Setting SERIAL_DB_ENTRY_COMPLETE True (FPC mode)")
                             result = plc.write((PLC_TAGS['SERIAL_DB_ENTRY_COMPLETE'], True))
@@ -1090,25 +1089,24 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                         logger.error("Rework inputs invalid: LH=%s, RH=%s", lhconv, rhconv)
                         continue
                     try:
-                        # Exact pair history (oldest -> newest)
                         cursor.execute(
                             "SELECT id, finished_serial, status FROM tn "
                             "WHERE component_serial1_date=? AND component_serial1=? "
                             "AND component_serial2_date=? AND component_serial2=? "
                             "ORDER BY id ASC",
-                            (extract_julian(lhconv), lhconv, extract_julian(rhconv), rhconv)
+                            (extract_julian(lhconv_n), lhconv_n, extract_julian(rhconv_n), rhconv_n)
                         )
                         pair_rows = cursor.fetchall()
                         cursor.execute(
                             "SELECT 1 FROM tn WHERE component_serial1_date=? AND component_serial1=? "
                             "AND NOT (component_serial2_date=? AND component_serial2=?) LIMIT 1",
-                            (extract_julian(lhconv), lhconv, extract_julian(rhconv), rhconv)
+                            (extract_julian(lhconv_n), lhconv_n, extract_julian(rhconv_n), rhconv_n)
                         )
                         mismatch_lh = cursor.fetchone() is not None
                         cursor.execute(
                             "SELECT 1 FROM tn WHERE component_serial2_date=? AND component_serial2=? "
                             "AND NOT (component_serial1_date=? AND component_serial1=?) LIMIT 1",
-                            (extract_julian(rhconv), rhconv, extract_julian(lhconv), lhconv)
+                            (extract_julian(rhconv_n), rhconv_n, extract_julian(lhconv_n), lhconv_n)
                         )
                         mismatch_rh = cursor.fetchone() is not None
                         normal_passes = sum(1 for _, _, st in pair_rows if st == 'Passed')
@@ -1170,15 +1168,17 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                                         SQL_STATEMENTS['insert_tn'],
                                         (ts,
                                          rework_tla_sn, extract_julian(rework_tla_sn),
-                                         lhconv, extract_julian(lhconv),
-                                         rhconv, extract_julian(rhconv),
+                                         lhconv_n, extract_julian(lhconv_n),
+                                         rhconv_n, extract_julian(rhconv_n),
                                          status_text)
                                     )
                                     conn.commit()
-                                    replicate_tn_to_backups(ts, rework_tla_sn, extract_julian(rework_tla_sn),
-                                                            lhconv, extract_julian(lhconv),
-                                                            rhconv, extract_julian(rhconv),
-                                                            status_text)
+                                    replicate_tn_to_backups(
+                                        ts, rework_tla_sn, extract_julian(rework_tla_sn),
+                                        lhconv_n, extract_julian(lhconv_n),
+                                        rhconv_n, extract_julian(rhconv_n),
+                                        status_text
+                                    )
                                     logger.info("Setting SERIAL_DB_ENTRY_COMPLETE True (Rework mode)")
                                     result = plc.write((PLC_TAGS['SERIAL_DB_ENTRY_COMPLETE'], True))
                                     if not result or getattr(result, 'error', None):
@@ -1222,10 +1222,19 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             ts = get_plc_timestamp(plc)
                             cursor.execute(
                                 SQL_STATEMENTS['insert_tn'],
-                                (ts, tla_sn, extract_julian(tla_sn), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Passed')
+                                (ts,
+                                 tla_sn, extract_julian(tla_sn),
+                                 lhconv_n, extract_julian(lhconv_n),
+                                 rhconv_n, extract_julian(rhconv_n),
+                                 'Passed')
                             )
                             conn.commit()
-                            replicate_tn_to_backups(ts, tla_sn, extract_julian(tla_sn), lhconv, extract_julian(lhconv), rhconv, extract_julian(rhconv), 'Passed')
+                            replicate_tn_to_backups(
+                                ts, tla_sn, extract_julian(tla_sn),
+                                lhconv_n, extract_julian(lhconv_n),
+                                rhconv_n, extract_julian(rhconv_n),
+                                'Passed'
+                            )
                             logger.info("Database entry created for pass: Serial=%s", tla_sn)
                             logger.info("Setting SERIAL_DB_ENTRY_COMPLETE True")
                             result = plc.write((PLC_TAGS['SERIAL_DB_ENTRY_COMPLETE'], True))
@@ -1293,6 +1302,8 @@ def ensure_all_dbs_initialized():
         logger.info("Ensuring database schema for %s", db_path)
         ensure_db_schema(db_path)
         logger.info("Database schema ensured for %s", db_path)
+
+        migrate_db_serial_normalization_once(db_path)
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="TN barcode converter serial checker")

@@ -145,7 +145,6 @@ PLC_TAGS = {
     'TORQUE_PASS':           'TN.TORQUE_PASS',
     'TORQUE_FAIL':           'TN.TORQUE_FAIL',
     'REWORK_MODE':           'TN.REWORK_MODE',
-    'REWORK_AUTH':           'TN.REWORK_AUTH',
     'SUPERVISOR_KEY':       'TN.SUPERVISOR_KEY',
     'CYCLE_READY':           'TN.CYCLE_READY',
     'DB_ENTRY_SUCCESS':     'TN.DB_ENTRY_SUCCESS',
@@ -806,8 +805,6 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                             safe_write(plc, PLC_TAGS['TN_CHECK_FAIL_LH'], False, verify=True, retries=3)
                             safe_write(plc, PLC_TAGS['TN_CHECK_FAIL_RH'], False, verify=True, retries=3)
                             safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], False, verify=True, retries=3)
-                            # Ensure REWORK_AUTH is cleared on cycle reset so PLC HMI isn't left waiting
-                            safe_write(plc, PLC_TAGS['REWORK_AUTH'], False, verify=True, retries=3)
                             write_plc_message(plc, "")
                             # clear DB entry success flag on reset
                             try:
@@ -876,96 +873,56 @@ def monitor_and_update(plc_ip_address: str, db_file: str) -> None:
                     logger.info("SERIALS CHECKED: " + ", ".join(f"{label}={sn}" for label, sn in serials))
 
                     if rework_mode:
-                        # Rework gating
+                        # Rework requirements (simplified):
+                        # 1) There must be at least one exact 4-way serial match in the database.
+                        # 2) None of the 4 serials may appear in any other row unless that row is the same exact 4-way match.
                         cursor.execute(
-                            "SELECT id FROM tn WHERE tla1=? AND conv1=? AND tla2=? AND conv2=? AND status='Passed' LIMIT 2",
+                            "SELECT 1 FROM tn WHERE tla1=? AND conv1=? AND tla2=? AND conv2=? AND lower(status)='passed' LIMIT 1",
                             (tla1, conv1, tla2, conv2)
                         )
-                        rows = cursor.fetchall()
-                        if len(rows) != 1:
-                            logger.warning("Rework gate fail: expected 1 base pass row, found %d", len(rows))
+                        if cursor.fetchone() is None:
+                            logger.warning("Rework gate fail: no existing 4-way match with status=Passed for this serial set")
+                            write_plc_message(plc, "Rework denied: no base pass")
                             safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], False, verify=True, retries=3)
                             continue
-                        base_id = rows[0][0]
-
-                        # Relax uniqueness: it's valid for these serials to appear in other rows (e.g., fails or prior attempts).
-                        # We already confirmed this exact 4-tuple has exactly one 'Passed' base row (base_id).
-                        # Proceed with rework using this base association.
-                        logger.info("Rework base association confirmed (base_id=%s); proceeding with rework checks", base_id)
 
                         cursor.execute(
-                            "SELECT COUNT(*) FROM tn WHERE tla1=? AND conv1=? AND tla2=? AND conv2=? AND status='Rework Pass'",
-                            (tla1, conv1, tla2, conv2)
+                            """
+                            SELECT id, date, status
+                            FROM tn
+                            WHERE (tla1=? OR conv1=? OR tla2=? OR conv2=?)
+                              AND NOT (tla1=? AND conv1=? AND tla2=? AND conv2=?)
+                            LIMIT 1
+                            """,
+                            (tla1, conv1, tla2, conv2, tla1, conv1, tla2, conv2)
                         )
-                        rework_pass_count = cursor.fetchone()[0]
-
-                        if rework_pass_count == 0:
-                            # First rework allowed — ensure REWORK_AUTH is cleared
-                            safe_write(plc, PLC_TAGS['REWORK_AUTH'], False, verify=True, retries=3)
-                            safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], True, verify=True, retries=3)
-                            logger.info("Rework gating pass: first rework (prior_reworks=0)")
-
-                            # Active-wait for torque result (level detect)
-                            tr = wait_for_torque_result(plc)
-                            if tr == 'pass':
-                                insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
-                                replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
-                                write_plc_message(plc, "")
-                                try:
-                                    safe_write(plc, PLC_TAGS['DB_ENTRY_SUCCESS'], True, verify=True, retries=3)
-                                except Exception:
-                                    logger.exception("Failed to set DB_ENTRY_SUCCESS after rework pass")
-                                logger.info("Inserted Rework Pass record")
-                                # Wait for cycle reset to allow a clean next cycle
-                                while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
-                                    time.sleep(FAST_POLL_INTERVAL)
-                            # if tr is 'fail' or None, just continue to next cycle (no insert)
-                            continue
+                        conflict = cursor.fetchone()
+                        if conflict is not None:
+                            conflict_id, conflict_date, conflict_status = conflict
+                            logger.warning(
+                                "Rework gate fail: found non-4-way match row (id=%s date=%s status=%s)",
+                                conflict_id, conflict_date, conflict_status
+                            )
+                            write_plc_message(plc, "Rework denied: serial mismatch history")
+                            safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], False, verify=True, retries=3)
                             continue
 
-                        # Additional reworks require supervisor override
-                        # Signal to PLC/HMI that supervisor authorization is required
-                        safe_write(plc, PLC_TAGS['REWORK_AUTH'], True, verify=True, retries=3)
-                        write_plc_message(plc, "Rework: Supervisor required")
-                        safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], False, verify=True, retries=3)
+                        safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], True, verify=True, retries=3)
+                        logger.info("Rework gating pass: exact 4-way match exists and no conflicting pairings found")
 
-                        # Wait for supervisor or reset
-                        while True:
-                            if read_tag(plc, PLC_TAGS['SEQ_STEP']) == 10:
-                                # clear REWORK_AUTH on abort/reset so PLC HMI stops prompting
-                                safe_write(plc, PLC_TAGS['REWORK_AUTH'], False, verify=True, retries=3)
-                                write_plc_message(plc, "")
-                                logger.info("Rework override aborted due to cycle reset (SEQ_STEP 10)")
-                                break
-                            if read_tag(plc, PLC_TAGS['SUPERVISOR_KEY']):
-                                # Supervisor accepted — clear auth request and proceed
-                                safe_write(plc, PLC_TAGS['REWORK_AUTH'], False, verify=True, retries=3)
-                                # write_plc_message(plc, "Rework: Supervisor accepted")  # removed to avoid overriding HMI instructions
-                                safe_write(plc, PLC_TAGS['TN_CHECK_PASS'], True, verify=True, retries=3)
-                                logger.info("Supervisor override granted; proceeding with torque gating")
-                                # Torque gating after override (active-poll)
-                                tr = wait_for_torque_result(plc)
-                                if tr == 'pass':
-                                    # read serials fresh
-                                    tla1 = (read_tag(plc, PLC_TAGS['TLA1']) or '').strip()
-                                    conv1 = (read_tag(plc, PLC_TAGS['CONV1']) or '').strip()
-                                    tla2 = (read_tag(plc, PLC_TAGS['TLA2']) or '').strip()
-                                    conv2 = (read_tag(plc, PLC_TAGS['CONV2']) or '').strip()
-                                    insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
-                                    replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
-                                    # write_plc_message(plc, "REWORK PASS")  # removed to avoid overriding HMI instructions
-                                    try:
-                                        safe_write(plc, PLC_TAGS['DB_ENTRY_SUCCESS'], True, verify=True, retries=3)
-                                    except Exception:
-                                        logger.exception("Failed to set DB_ENTRY_SUCCESS after rework pass (override)")
-                                    logger.info("Inserted Rework Pass record (override)")
-                                    # wait for reset
-                                    while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
-                                        time.sleep(FAST_POLL_INTERVAL)
-                                else:
-                                    logger.warning("Rework torque not passed (override) – no insert; continuing")
-                                break
-                            time.sleep(POLL_INTERVAL)
+                        tr = wait_for_torque_result(plc)
+                        if tr == 'pass':
+                            insert_tn_record(db_file, ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
+                            replicate_tn_to_backups(ts, tla1, tla1_date, conv1, conv1_date, tla2, tla2_date, conv2, conv2_date, 'Rework Pass')
+                            write_plc_message(plc, "")
+                            try:
+                                safe_write(plc, PLC_TAGS['DB_ENTRY_SUCCESS'], True, verify=True, retries=3)
+                            except Exception:
+                                logger.exception("Failed to set DB_ENTRY_SUCCESS after rework pass")
+                            logger.info("Inserted Rework Pass record")
+                            while read_tag(plc, PLC_TAGS['SEQ_STEP']) != 10:
+                                time.sleep(FAST_POLL_INTERVAL)
+                        # if tr is 'fail' or None, just continue to next cycle (no insert)
                         continue
 
                     # Normal mode

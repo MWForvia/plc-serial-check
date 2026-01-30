@@ -1,0 +1,75 @@
+---
+config:
+  layout: fixed
+---
+flowchart TB
+    G{"First Piece Check?"} --> H("FPC criteria:<br>Scanned serials match saved Red/Green Rabbit serials")
+    G -- No --> I{"Rework Mode?<br>(Set by HMI)"}
+    K{"Leak test passed and label printed?"} --> M{"FPC label replaces the barcode with a black square<br>so it can't be used on a production part." }
+    N[("Database entry created")] --> O{"Status field entry:<br>Normal Mode — 'Pass'<br>FPC Mode — 'FPC Pass'<br>Rework Mode — 'Rework Pass Previous TLA SN ##'" } & Z["Reset"]
+    Q[("Database entry created")] --> R{"Status field entry:<br>'Serial Check Failed - TLA SN used Converter SN ##'" } & Z
+    A["DB Integrity and Structure Check<br>Tri-Directional Data Sync"] --> B["Monitor loop"]
+    B --> C{"Scan Complete?"}
+    C --> D["Read extracted serial numbers"]
+    D --> E{"All serial numbers are unique?"}
+    E -- Yes --> F["Normal Mode:<br>Set PLC tag Serial_Check_Pass = 1"]
+    F --> K
+    K -- No --> L["Leak Test Fail<br>No DB Entry Created<br>"]
+    L --> Z
+    K -- Yes --> N
+    E -- No --> G
+    G -- Yes --> K
+    J{"All serial numbers form a pair/set and have always been recorded together?"} -- No --> P["Set PLC tag Serial_Check_Fail = 1"]
+    I -- Yes --> J
+    J -- Yes --> K
+    P --> Q
+    I -- No --> P
+
+    M@{ shape: rounded}
+    O@{ shape: rounded}
+    R@{ shape: rounded}
+     G:::plc
+     H:::note
+     I:::plc
+     K:::plc
+     M:::note
+     N:::db
+     O:::note
+     Q:::db
+     R:::note
+     A:::info
+     B:::info
+     C:::plc
+     D:::info
+     E:::db
+     F:::plc
+     L:::plc
+     J:::db
+     P:::plc
+    classDef info fill:#e3f2fd,stroke:#1e88e5
+    classDef plc fill:#fff3cd,stroke:#f9a825,stroke-width:2px
+    classDef db fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    classDef note fill:#f9f9f9,stroke:#999,stroke-dasharray:5 5
+    linkStyle 0 stroke-dasharray:5 5, marker-end:none,fill:none
+    linkStyle 1 stroke:#D50000,fill:none
+    linkStyle 2 stroke-dasharray:5 5, marker-end:none,fill:none
+    linkStyle 3 stroke-dasharray:5 5, marker-end:none,fill:none
+    linkStyle 4 stroke:#2962FF,fill:none
+    linkStyle 5 stroke-dasharray:5 5, marker-end:none,fill:none
+    linkStyle 6 stroke:#2962FF,fill:none
+    linkStyle 7 stroke:#2962FF,fill:none
+    linkStyle 8 stroke:#2962FF,fill:none
+    linkStyle 9 stroke:#2962FF,fill:none
+    linkStyle 10 stroke:#2962FF,fill:none
+    linkStyle 11 stroke:#00C853,fill:none
+    linkStyle 12 stroke:#00C853,fill:none
+    linkStyle 13 stroke:#D50000,fill:none
+    linkStyle 14 stroke:#2962FF,fill:none
+    linkStyle 15 stroke:#00C853,fill:none
+    linkStyle 16 stroke:#D50000,fill:none
+    linkStyle 17 stroke:#00C853,fill:none
+    linkStyle 18 stroke:#D50000,fill:none
+    linkStyle 19 stroke:#00C853,fill:none
+    linkStyle 20 stroke:#00C853,fill:none
+    linkStyle 21 stroke:#2962FF,fill:none
+    linkStyle 22 stroke:#D50000,fill:none

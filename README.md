@@ -3,14 +3,19 @@ gap900
 maint1585
 ip - 10.131.201.150
 plc ip - 10.131.201.60
-see print: "tail f ~/tnpy.log"
+view log files via ssh (putty) via terminal commands:
+tail -f tnpy900.log
+tail -f tnpy900_debug.log
 
 300 Line RPi:
 gap300
 maint1585
 ip - 192.168.1.150
 plc ip - 192.168.1.1
-see print: "tail f ~/tnpy.log"
+view log files via ssh (putty) via terminal commands:
+tail -f tnpy300.log
+tail -f tnpy300_debug.log
+
 
 All scripts create missing files/directories if needed.
 If hardware fails, backup RPi on shelf - one for 900, one for 300. These are fully imaged, to get the spare RPi running:

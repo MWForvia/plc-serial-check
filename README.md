@@ -26,18 +26,6 @@ If hardware fails, backup RPi on shelf - one for 900, one for 300. These are ful
   Plug in power to the new RPi
 On startup it will copy the backed up database from the usb memory to the sdcard directory.
 
-PLC_TAGS (tnpy.py) = 
-    'LH_CONV': 'FIX_513D.Conv_Barcode.EXTRACT[2]',
-    'RH_CONV': 'FIX_513D.Conv_Barcode_R.EXTRACT[2]',
-    'DATASTORE': 'FIX_513D.Seq.Data_Store',
-    'UNCLAMP': 'FIX_513D.Main.Unclamp_Part',
-    'SEQ_STEP': 'SEQUENCE_STEP',
-    'FINISHED_SERIAL': 'ZEBRA.Working_String[20]',
-    'SCAN_COMPLETE': 'FIX_513D.Seq.Conv_Barcode_Passed',
-    'TN_CHECK_PASS': 'TN_Check_Pass',
-    'TN_CHECK_FAIL': 'TN_Check_Fail',
-    'TN_DB_ERROR': 'TN_DB_Error'
-
 Saved files (dbtocsv.py - runs daily at 3am)
     CSV Exports (File name has yesterday's date appended)
         /home/gap900/csv_exports/YYYY-MM-DD.csv
